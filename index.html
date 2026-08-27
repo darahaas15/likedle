@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0d11">
+  <title>Likedle - guess your own Liked Songs</title>
+  <meta name="description" content="A Songless/Heardle-style game that uses your Spotify Liked Songs.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b0d11'/%3E%3Cpath d='M44 12v26.5a8.5 8.5 0 1 1-4-7.2V20l-14 3.5v19a8.5 8.5 0 1 1-4-7.2V17l22-5z' fill='%231ed760'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="14" fill="#11151c"/><path d="M44 12v26.5a8.5 8.5 0 1 1-4-7.2V20l-14 3.5v19a8.5 8.5 0 1 1-4-7.2V17l22-5z" fill="#1ed760"/></svg>
+        <span class="brand-name">Likedle</span>
+      </div>
+      <div class="topbar-actions" id="topbarActions" hidden>
+        <button class="icon-btn" id="statsBtn" aria-label="Statistics" title="Statistics">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10m6 10V4m6 16v-7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" fill="none"/></svg>
+        </button>
+        <button class="icon-btn" id="settingsBtn" aria-label="Settings" title="Settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z" stroke="currentColor" stroke-width="2" fill="none"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.58 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.65 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.08A1.7 1.7 0 0 0 10.12 3V3a2 2 0 1 1 4 0v.09c0 .68.4 1.3 1.03 1.56.6.27 1.3.14 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.08c.26.63.88 1.03 1.56 1.03H21a2 2 0 1 1 0 4h-.09c-.68 0-1.3.4-1.51 1.03z" stroke="currentColor" stroke-width="2" fill="none" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- ============ SETUP ============ -->
+    <section class="screen" id="screen-setup">
+      <div class="card intro-card">
+        <h1>Guess songs from your own <span class="accent">Liked Songs</span></h1>
+        <p class="lede">
+          Likedle is a Songless-style game: hear a tiny snippet, guess the track, unlock more
+          seconds with every miss. It plays only songs you have liked on Spotify.
+        </p>
+        <p class="lede">
+          One-time setup: create a (free) Spotify developer app so Likedle can read your library.
+          Takes about two minutes.
+        </p>
+
+        <ol class="steps">
+          <li>
+            <span class="step-num">1</span>
+            <div>Open <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">developer.spotify.com/dashboard</a> and log in with your Spotify account.</div>
+          </li>
+          <li>
+            <span class="step-num">2</span>
+            <div>Click <strong>Create app</strong>. Name and description can be anything (e.g. "Likedle").</div>
+          </li>
+          <li>
+            <span class="step-num">3</span>
+            <div>
+              In <strong>Redirect URIs</strong>, add exactly:
+              <div class="copy-chip">
+                <code id="redirectUriText"></code>
+                <button class="chip-btn" id="copyUriBtn">Copy</button>
+              </div>
+              Under "Which API/SDKs are you planning to use?" tick <strong>Web API</strong> and <strong>Web Playback SDK</strong>, then save.
+            </div>
+          </li>
+          <li>
+            <span class="step-num">4</span>
+            <div>Open your new app's <strong>Settings</strong>, copy the <strong>Client ID</strong> and paste it here:</div>
+          </li>
+        </ol>
+
+        <div class="field-row">
+          <input type="text" id="clientIdInput" class="text-input mono" placeholder="Client ID (32 characters)" autocomplete="off" spellcheck="false">
+          <button class="btn btn-primary" id="saveClientIdBtn">Continue</button>
+        </div>
+        <p class="fine-print">Your Client ID stays in this browser only. Nothing is sent anywhere except to Spotify.</p>
+      </div>
+    </section>
+
+    <!-- ============ LOGIN ============ -->
+    <section class="screen" id="screen-login">
+      <div class="card center-card">
+        <svg class="hero-mark" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="14" fill="#11151c"/><path d="M44 12v26.5a8.5 8.5 0 1 1-4-7.2V20l-14 3.5v19a8.5 8.5 0 1 1-4-7.2V17l22-5z" fill="#1ed760"/></svg>
+        <h1>Connect your Spotify</h1>
+        <p class="lede">
+          Likedle asks for permission to read your Liked Songs and control playback
+          (that is how snippets get played).
+        </p>
+        <button class="btn btn-primary btn-lg" id="loginBtn">Connect Spotify</button>
+        <button class="btn btn-link" id="changeClientIdBtn">Use a different Client ID</button>
+      </div>
+    </section>
+
+    <!-- ============ SYNC ============ -->
+    <section class="screen" id="screen-sync">
+      <div class="card center-card">
+        <h1>Loading your Liked Songs</h1>
+        <p class="lede" id="syncStatus">Contacting Spotify...</p>
+        <div class="progress-track"><div class="progress-fill" id="syncProgress"></div></div>
+        <button class="btn btn-ghost" id="syncRetryBtn" hidden>Retry</button>
+      </div>
+    </section>
+
+    <!-- ============ GAME ============ -->
+    <section class="screen" id="screen-game">
+      <div class="game-col">
+
+        <ol class="guess-rows" id="guessRows"></ol>
+
+        <div class="stage-area">
+          <div class="timeline" id="timeline">
+            <div class="timeline-fill" id="timelineFill"></div>
+            <div class="timeline-locked" id="timelineLocked"></div>
+          </div>
+          <div class="timeline-labels" id="timelineLabels"></div>
+
+          <div class="play-row">
+            <button class="play-btn" id="playBtn">
+              <svg class="ic-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5-11-6.5z" fill="currentColor"/></svg>
+              <svg class="ic-stop" viewBox="0 0 24 24" aria-hidden="true" hidden><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor"/></svg>
+              <span id="playBtnLabel">Play 1s</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="controls" id="controls">
+          <div class="guess-box">
+            <input type="text" id="guessInput" class="text-input" placeholder="Search your Liked Songs..." autocomplete="off" spellcheck="false" aria-label="Guess a song">
+            <div class="suggestions" id="suggestions" hidden></div>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-ghost" id="skipBtn">Skip (+1s)</button>
+            <button class="btn btn-primary" id="submitBtn" disabled>Guess</button>
+          </div>
+        </div>
+
+        <div class="reveal-card" id="revealCard" hidden>
+          <img class="reveal-art" id="revealArt" alt="Album art">
+          <div class="reveal-meta">
+            <div class="reveal-result" id="revealResult"></div>
+            <div class="reveal-title" id="revealTitle"></div>
+            <div class="reveal-artist" id="revealArtist"></div>
+          </div>
+          <div class="btn-row">
+            <a class="btn btn-ghost" id="revealOpenLink" target="_blank" rel="noopener">Open in Spotify</a>
+            <button class="btn btn-primary" id="nextBtn">Next song</button>
+          </div>
+        </div>
+
+        <p class="game-foot" id="gameFoot"></p>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ SETTINGS MODAL ============ -->
+  <div class="modal-backdrop" id="settingsModal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="modal-head">
+        <h2 id="settingsTitle">Settings</h2>
+        <button class="icon-btn" data-close aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></button>
+      </div>
+
+      <div class="setting-group">
+        <h3>Playback</h3>
+        <label class="radio-row"><input type="radio" name="mode" value="browser"><span><strong>In this browser</strong><small>Full-track snippets via the Spotify web player. Needs Premium. Desktop browsers only.</small></span></label>
+        <label class="radio-row"><input type="radio" name="mode" value="device"><span><strong>On a Spotify device</strong><small>Plays snippets through the Spotify app on your Mac or iPhone. Needs Premium.</small></span></label>
+        <label class="radio-row"><input type="radio" name="mode" value="preview"><span><strong>30s previews</strong><small>Apple's public song previews. Works without Premium; a few songs may be missing.</small></span></label>
+        <div class="device-picker" id="devicePicker" hidden>
+          <div class="device-picker-head">
+            <span>Pick a device (open Spotify on it first)</span>
+            <button class="chip-btn" id="refreshDevicesBtn">Refresh</button>
+          </div>
+          <div id="deviceList" class="device-list"></div>
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <h3>Snippet position</h3>
+        <label class="radio-row"><input type="radio" name="snippetStart" value="start"><span><strong>Start of the song</strong><small>Classic Heardle style.</small></span></label>
+        <label class="radio-row"><input type="radio" name="snippetStart" value="random"><span><strong>Random position</strong><small>Harder - skips long intros.</small></span></label>
+      </div>
+
+      <div class="setting-group">
+        <h3>Library</h3>
+        <p class="setting-note" id="libraryInfo"></p>
+        <div class="btn-row left">
+          <button class="btn btn-ghost" id="resyncBtn">Re-sync Liked Songs</button>
+          <button class="btn btn-ghost danger" id="logoutBtn">Log out</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ STATS MODAL ============ -->
+  <div class="modal-backdrop" id="statsModal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="statsTitle">
+      <div class="modal-head">
+        <h2 id="statsTitle">Statistics</h2>
+        <button class="icon-btn" data-close aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></button>
+      </div>
+      <div class="stat-tiles">
+        <div class="stat-tile"><span class="stat-num" id="statPlayed">0</span><span class="stat-label">Played</span></div>
+        <div class="stat-tile"><span class="stat-num" id="statWinPct">0%</span><span class="stat-label">Win rate</span></div>
+        <div class="stat-tile"><span class="stat-num" id="statStreak">0</span><span class="stat-label">Streak</span></div>
+        <div class="stat-tile"><span class="stat-num" id="statMaxStreak">0</span><span class="stat-label">Best streak</span></div>
+      </div>
+      <h3 class="dist-title">Guess distribution</h3>
+      <div class="dist" id="distBars"></div>
+      <p class="fine-print">Stats live in this browser only.</p>
+    </div>
+  </div>
+
+  <div class="toast-wrap" id="toastWrap"></div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

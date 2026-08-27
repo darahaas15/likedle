@@ -1,0 +1,7 @@
+{
+  "name": "likedle",
+  "version": "1.0.0",
+  "description": "Songless/Heardle-style game for your Spotify Liked Songs",
+  "type": "module",
+  "private": true
+}
