@@ -353,6 +353,9 @@ h3 { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacin
   padding: 4px 8px;
 }
 .mode-line:hover { color: var(--text); text-decoration: underline; }
+.mode-line[data-status="connecting"] { color: var(--warn); }
+.mode-line[data-status="error"],
+.mode-line[data-status="disconnected"] { color: var(--danger); }
 
 .play-btn {
   font-family: inherit;
@@ -520,6 +523,8 @@ h3 { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacin
   font-size: 13px;
   color: var(--muted);
 }
+.device-actions { display: flex; align-items: center; gap: 6px; }
+.device-actions .chip-btn { color: var(--text); text-decoration: none; }
 .device-list { display: flex; flex-direction: column; gap: 8px; }
 .device-item {
   font-family: inherit;
@@ -536,9 +541,24 @@ h3 { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacin
 }
 .device-item:hover { border-color: var(--border); }
 .device-item.selected { border-color: var(--accent); background: var(--accent-soft); }
+.device-item.disabled { opacity: 0.45; cursor: not-allowed; }
 .device-item strong { font-size: 14px; font-weight: 600; }
 .device-item small { color: var(--muted); font-size: 12px; }
 .device-empty { color: var(--muted); font-size: 13px; line-height: 1.5; }
+.device-help { color: var(--muted); font-size: 12px; line-height: 1.45; margin: 0; }
+.receiver-status {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  margin: 0;
+  padding: 10px 12px;
+}
+.receiver-status[data-status="ready"] { border-color: rgba(30, 215, 96, 0.35); color: var(--accent); }
+.receiver-status[data-status="connecting"] { border-color: rgba(255, 209, 102, 0.35); color: var(--warn); }
+.receiver-status[data-status="error"],
+.receiver-status[data-status="disconnected"] { border-color: rgba(255, 107, 107, 0.35); color: var(--danger); }
 
 /* ============ Stats ============ */
 

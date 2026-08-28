@@ -9,8 +9,13 @@ import {
 import {
   loadProfile, fetchAndCacheProfile, getDevices, searchLibrary,
   fetchQuickBatch, loadLibCache, backgroundSync, topUpLibCache, clearLibCache,
+  resolveDevice,
 } from './spotify.js';
-import { playSnippet, stop as stopPlayback, primeAudio, findPreviewUrl } from './player.js';
+import {
+  playSnippet, stop as stopPlayback, primeAudio, findPreviewUrl,
+  prefetchPreview, prepareBrowserReceiver, activateBrowserElement,
+  getBrowserReceiverStatus, onBrowserReceiverStatus,
+} from './player.js';
 import { newRound, submitGuess, skip, loadStats, recordResult } from './game.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -26,10 +31,13 @@ const state = {
   round: null,
   selectedGuess: null,
   playing: false,
+  audioPreparing: false,
   poolReady: false,
   syncGen: 0,
   syncError: false,
   suggestionIndex: -1,
+  previewGeneration: 0,
+  browserReceiver: getBrowserReceiverStatus(),
   uitest: false,
 };
 
@@ -105,6 +113,9 @@ function effectiveMode() {
   if (state.profile && state.profile.product && state.profile.product !== 'premium') {
     return 'preview'; // Spotify playback control needs Premium
   }
+  if (!state.settings.mode && state.settings.deviceName && state.settings.deviceType === 'Computer') {
+    return 'device';
+  }
   return state.settings.mode || 'preview';
 }
 
@@ -118,15 +129,27 @@ function effectiveSettings() {
 
 function modeLabel() {
   switch (effectiveMode()) {
-    case 'browser': return 'full tracks in this browser';
-    case 'device': return `Spotify on ${state.settings.deviceName || 'a device'}`;
-    default: return '30-second previews';
+    case 'browser': return `this browser via Spotify - ${state.browserReceiver.message.toLowerCase()}`;
+    case 'device': return `Spotify on ${state.settings.deviceName || 'your computer'}`;
+    default: return 'this device using 30-second previews';
   }
 }
 
 function updateModeLine() {
   $('#modeLine').textContent = `Sound: ${modeLabel()} - change`;
+  $('#modeLine').dataset.status = effectiveMode() === 'browser'
+    ? state.browserReceiver.state
+    : 'ready';
 }
+
+onBrowserReceiverStatus((status) => {
+  state.browserReceiver = status;
+  if ($('#modeLine') && effectiveMode() === 'browser') updateModeLine();
+  if ($('#receiverStatus')) {
+    $('#receiverStatus').textContent = `Browser receiver: ${status.message}`;
+    $('#receiverStatus').dataset.status = status.state;
+  }
+});
 
 function maybeShowPremiumHint() {
   if (
@@ -366,8 +389,10 @@ function animateFill(durMs) {
 
 // ---------- Game: flow ----------
 
-function startRound() {
+function startRound(previewAttempt = 0) {
   stopPlayback();
+  state.previewGeneration += 1;
+  state.audioPreparing = false;
   const answers = currentAnswers();
   if (!answers.length) return;
   state.round = newRound(answers, state.settings);
@@ -380,11 +405,48 @@ function startRound() {
   renderGuessRows();
   updateStageUi();
   setPlayingUi(false);
+  prepareRoundPlayback(state.round, previewAttempt);
+}
+
+async function prepareRoundPlayback(round, previewAttempt = 0) {
+  const mode = effectiveMode();
+  if (mode === 'browser') {
+    prepareBrowserReceiver().catch(() => {
+      // The receiver status listener shows the actionable failure state.
+    });
+    return;
+  }
+  if (mode !== 'preview') return;
+
+  const generation = ++state.previewGeneration;
+  state.audioPreparing = true;
+  const btn = $('#playBtn');
+  btn.disabled = true;
+  $('#playBtnLabel').textContent = 'Finding audio...';
+  let url = null;
+  try {
+    url = await prefetchPreview(round.track, state.profile ? state.profile.country : null);
+  } catch { /* play will surface a source error if needed */ }
+  if (generation !== state.previewGeneration || state.round !== round) return;
+
+  if (!url && previewAttempt < 5) {
+    startRound(previewAttempt + 1);
+    return;
+  }
+  state.audioPreparing = false;
+  btn.disabled = false;
+  updateStageUi();
+  if (!url) {
+    toast('Could not pre-load a preview after several songs. You can retry Play or choose your computer in Settings.', 'error', 6500);
+  }
 }
 
 async function onPlay() {
   if (!state.round) return;
   primeAudio(); // synchronous, inside the gesture: unlocks audio on iOS
+  if (effectiveMode() === 'browser') {
+    activateBrowserElement(); // must run before the first await
+  }
   if (state.playing) {
     await stopPlayback();
     setPlayingUi(false);
@@ -398,18 +460,36 @@ async function onPlay() {
   btn.disabled = true;
   $('#playBtnLabel').textContent = 'Starting...';
   try {
-    await playSnippet(round.track, round.startMs, durMs, effectiveSettings(), () => setPlayingUi(false));
+    const result = await playSnippet(
+      round.track,
+      round.startMs,
+      durMs,
+      effectiveSettings(),
+      () => setPlayingUi(false),
+    );
+    if (result.device) {
+      const changed = state.settings.deviceId !== result.device.id
+        || state.settings.deviceName !== result.device.name
+        || state.settings.deviceType !== result.device.type;
+      if (changed) {
+        state.settings.deviceId = result.device.id;
+        state.settings.deviceName = result.device.name;
+        state.settings.deviceType = result.device.type;
+        saveSettings(state.settings);
+        updateModeLine();
+      }
+    }
     setPlayingUi(true);
     animateFill(durMs);
   } catch (e) {
-    handlePlayError(e);
+    await handlePlayError(e);
   } finally {
-    btn.disabled = false;
-    if (!state.playing) setPlayingUi(false); // restores the Play label on failure
+    btn.disabled = state.audioPreparing;
+    if (!state.playing && !state.audioPreparing) setPlayingUi(false);
   }
 }
 
-function handlePlayError(e) {
+async function handlePlayError(e) {
   setPlayingUi(false);
   switch (e.code) {
     case 'canceled':
@@ -418,20 +498,47 @@ function handlePlayError(e) {
       toast(e.message, 'error', 5000);
       return;
     case 'premium':
-      state.settings.mode = null;
+      state.settings.mode = 'preview';
       saveSettings(state.settings);
       updateModeLine();
-      toast('Spotify Premium is needed for that mode. Switched to 30s previews - press play again.', 'error', 6000);
+      prepareRoundPlayback(state.round);
+      toast('Spotify Premium is needed for that mode. Switched to previews played directly here.', 'error', 6000);
+      break;
+    case 'forbidden':
+      try {
+        state.profile = await fetchAndCacheProfile();
+      } catch { /* retain the last known profile */ }
+      if (state.profile && state.profile.product !== 'premium') {
+        state.settings.mode = 'preview';
+        saveSettings(state.settings);
+        updateModeLine();
+        prepareRoundPlayback(state.round);
+        toast('Spotify playback now requires Premium. Switched to previews played directly here.', 'error', 6500);
+      } else {
+        toast(`${e.message} Refresh the receiver list or choose another playback option.`, 'error', 6500);
+        openSettings();
+      }
       break;
     case 'init':
-      state.settings.mode = 'device';
-      saveSettings(state.settings);
-      updateModeLine();
-      toast('The in-browser player is not supported here. Pick a Spotify device in Settings (open Spotify on your Mac/iPhone first).', 'error', 7000);
+      toast(`The Spotify browser receiver could not start: ${e.message}`, 'error', 7000);
       openSettings();
       break;
     case 'auth':
       toast('Spotify rejected the web player session. Check that "Web Playback SDK" is ticked in your Spotify app settings, or switch to previews in Settings.', 'error', 7000);
+      break;
+    case 'autoplay':
+      toast('Your browser blocked Spotify audio. Press Play once more, or use your computer as the Spotify receiver.', 'error', 6500);
+      break;
+    case 'gesture-required':
+      toast(e.message, 'info', 5000);
+      break;
+    case 'playback':
+    case 'disconnected':
+      toast(`${e.message} The receiver was reconnected once; choose your computer or direct previews if this continues.`, 'error', 7500);
+      break;
+    case 'restricted':
+      toast(e.message, 'error', 6500);
+      openSettings();
       break;
     case 'no-device':
       toast(e.message, 'error', 6000);
@@ -606,9 +713,10 @@ function openSettings() {
 }
 
 function toggleDevicePicker() {
-  const show = effectiveMode() === 'device';
-  $('#devicePicker').hidden = !show;
-  if (show) refreshDevices();
+  const mode = effectiveMode();
+  $('#devicePicker').hidden = mode !== 'device';
+  $('#receiverStatus').hidden = mode !== 'browser';
+  if (mode === 'device') refreshDevices();
 }
 
 async function refreshDevices() {
@@ -618,28 +726,53 @@ async function refreshDevices() {
     const devices = await getDevices();
     list.innerHTML = '';
     if (!devices.length) {
-      list.innerHTML = '<div class="device-empty">No devices found. Open the Spotify app on your Mac or iPhone, play and pause any song once so it registers, then hit Refresh.</div>';
+      list.innerHTML = '<div class="device-empty">No receivers are online. Open Spotify on your Mac, then hit Refresh. An iPhone disappears again when iOS suspends Spotify.</div>';
       return;
     }
+
+    const refreshedSelection = resolveDevice(devices, state.settings);
+    if (refreshedSelection && refreshedSelection.id !== state.settings.deviceId) {
+      state.settings.deviceId = refreshedSelection.id;
+      state.settings.deviceName = refreshedSelection.name;
+      state.settings.deviceType = refreshedSelection.type;
+      saveSettings(state.settings);
+      updateModeLine();
+    }
+
+    const rank = { Computer: 0, Speaker: 1, Smartphone: 2 };
+    devices.sort((a, b) => (rank[a.type] ?? 3) - (rank[b.type] ?? 3) || a.name.localeCompare(b.name));
     devices.forEach((d) => {
       const btn = document.createElement('button');
-      btn.className = `device-item${d.id === state.settings.deviceId ? ' selected' : ''}`;
+      const selected = d.id === state.settings.deviceId;
+      btn.className = `device-item${selected ? ' selected' : ''}${d.is_restricted ? ' disabled' : ''}`;
+      btn.disabled = d.is_restricted;
       btn.innerHTML = '<strong></strong><small></small>';
       btn.querySelector('strong').textContent = d.name;
-      btn.querySelector('small').textContent = d.type + (d.is_active ? ' - active' : '');
+      const details = [d.type];
+      if (d.type === 'Computer') details.push('recommended');
+      if (d.type === 'Smartphone') details.push('disconnects when Spotify sleeps');
+      if (d.is_active) details.push('active');
+      if (d.is_restricted) details.push('cannot be controlled');
+      btn.querySelector('small').textContent = details.join(' - ');
       btn.addEventListener('click', () => {
         state.settings.deviceId = d.id;
         state.settings.deviceName = d.name;
+        state.settings.deviceType = d.type;
         saveSettings(state.settings);
         $$('.device-item').forEach((el) => el.classList.remove('selected'));
         btn.classList.add('selected');
         updateModeLine();
-        toast(`Snippets will play on "${d.name}".`, 'success');
+        toast(
+          d.type === 'Computer'
+            ? `Your phone can stay on Likedle while "${d.name}" plays the snippets.`
+            : `Snippets will play on "${d.name}".`,
+          'success',
+        );
       });
       list.appendChild(btn);
     });
-  } catch {
-    list.innerHTML = '<div class="device-empty">Could not load devices.</div>';
+  } catch (error) {
+    list.innerHTML = `<div class="device-empty">Could not load receivers: ${error.message}</div>`;
   }
 }
 
@@ -647,10 +780,20 @@ $('#settingsBtn').addEventListener('click', openSettings);
 $('#refreshDevicesBtn').addEventListener('click', refreshDevices);
 
 $$('input[name="mode"]').forEach((r) => r.addEventListener('change', () => {
+  if (r.value === 'browser') activateBrowserElement();
+  stopPlayback();
+  setPlayingUi(false);
+  state.previewGeneration += 1;
+  state.audioPreparing = false;
   state.settings.mode = r.value;
   saveSettings(state.settings);
   updateModeLine();
   toggleDevicePicker();
+  if (state.round) {
+    $('#playBtn').disabled = false;
+    updateStageUi();
+    prepareRoundPlayback(state.round);
+  }
 }));
 
 $$('input[name="snippetStart"]').forEach((r) => r.addEventListener('change', () => {

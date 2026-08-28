@@ -58,6 +58,36 @@ export async function getDevices() {
   return (data && data.devices) || [];
 }
 
+// Spotify documents device IDs as only "persistent to some extent". Match the
+// fresh list by ID first, then by the user-visible name and type we remembered.
+// Never fall back to an arbitrary device: doing so could reveal the answer.
+export function resolveDevice(devices, preference = {}) {
+  const available = (devices || []).filter((d) => d && d.id && !d.is_restricted);
+  const byId = available.find((d) => d.id === preference.deviceId);
+  if (byId) return byId;
+
+  const wantedName = (preference.deviceName || '').trim().toLocaleLowerCase();
+  if (!wantedName) return null;
+  const wantedType = (preference.deviceType || '').trim().toLocaleLowerCase();
+  const matches = available.filter((d) => {
+    const sameName = (d.name || '').trim().toLocaleLowerCase() === wantedName;
+    const sameType = !wantedType || (d.type || '').trim().toLocaleLowerCase() === wantedType;
+    return sameName && sameType;
+  });
+  return matches.length === 1 ? matches[0] : null;
+}
+
+export function getPlaybackState() {
+  return apiFetch('/me/player');
+}
+
+export function transferPlayback(deviceId, play = false) {
+  return apiFetch('/me/player', {
+    method: 'PUT',
+    body: JSON.stringify({ device_ids: [deviceId], play }),
+  });
+}
+
 export function playOnDevice(deviceId, uri, positionMs) {
   return apiFetch(`/me/player/play?device_id=${encodeURIComponent(deviceId)}`, {
     method: 'PUT',

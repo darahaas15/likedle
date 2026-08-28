@@ -25,16 +25,21 @@ On load it fetches a few random pages of your Liked Songs (a fresh random sample
 
 ## Playback modes
 
-- **30s previews** (default): matches each track to Apple's public previews, trying your Spotify country's storefront first. Works everywhere - no Premium needed, including iPhone browsers. Rounds whose track has no preview are re-drawn.
-- **In this browser**: full-track snippets via the Spotify Web Playback SDK. Requires Spotify Premium; desktop browsers only.
-- **On a Spotify device**: Likedle remote-controls the Spotify app on your Mac or iPhone via Spotify Connect. Requires Premium.
+- **Play on my computer** (recommended): keep Likedle open on your phone while Spotify on your Mac plays the snippets.
+  Likedle refreshes changing Spotify device IDs, transfers playback when needed, verifies that the track started, and retries one dropped connection.
+- **Play directly on this phone or browser**: matches each track to Apple's public previews, trying your Spotify country's storefront first.
+  It needs no Premium account or open Spotify app, but a few songs may not have previews.
+- **Spotify inside this browser** (advanced): plays full-track snippets through a managed Spotify Web Playback SDK receiver.
+  It requires Premium and a browser that supports protected audio.
 
 Non-Premium accounts are locked to previews (Spotify does not allow playback control otherwise); Premium users get a one-time hint that the full-track modes exist.
+Spotify on an iPhone is only a best-effort remote receiver because iOS can suspend it when playback is paused or the Spotify app is closed.
 
 ## Development
 
 No build step.
 Serve the directory with any static file server, e.g. `python3 -m http.server 4173`, and open `http://localhost:4173/`.
 For local play you would need to register `http://127.0.0.1:4173/` as an additional Redirect URI in your Spotify app (Spotify only allows loopback HTTP; localhost hostnames must use HTTPS).
+Run the playback regression suite with `npm test`.
 
 Game tuning lives in `js/config.js` (stage lengths, scopes, storage keys).

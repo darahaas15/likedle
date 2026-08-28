@@ -2,10 +2,6 @@
 export const STAGES_MS = [1000, 2000, 4000, 7000, 11000, 16000];
 export const MAX_GUESSES = STAGES_MS.length;
 
-// Extra time scheduled after the snippet in Spotify modes, to absorb
-// play-command latency so the user never hears LESS than the stage length.
-export const SPOTIFY_LATENCY_PAD_MS = 150;
-
 // Library loading: the game starts from a few random pages of Liked Songs
 // (instant), while the full library syncs in the background for autocomplete.
 export const PAGE_SIZE = 50;
@@ -42,6 +38,7 @@ export const DEFAULT_SETTINGS = {
   mode: null, // null = auto | 'browser' | 'device' | 'preview'
   deviceId: null,
   deviceName: null,
+  deviceType: null,
   snippetStart: 'start', // 'start' | 'random'
 };
 

@@ -10,7 +10,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="styles.css?v=3">
+  <link rel="stylesheet" href="styles.css?v=4">
 </head>
 <body>
 
@@ -166,16 +166,21 @@
       <div class="setting-group">
         <h3>Playback</h3>
         <p class="setting-note" id="premiumNote" hidden>Your Spotify account is not Premium, so Spotify only allows the previews mode.</p>
-        <label class="radio-row"><input type="radio" name="mode" value="preview"><span><strong>30s previews</strong><small>Song previews from Apple's public catalog. Works everywhere, no Premium needed. A few songs may be missing.</small></span></label>
-        <label class="radio-row"><input type="radio" name="mode" value="browser"><span><strong>In this browser</strong><small>Full-track snippets via the Spotify web player. Needs Premium. Desktop browsers only.</small></span></label>
-        <label class="radio-row"><input type="radio" name="mode" value="device"><span><strong>On a Spotify device</strong><small>Plays snippets through the Spotify app on your Mac or iPhone. Needs Premium. Spoiler alert: the Spotify app displays the song it plays - keep it out of sight.</small></span></label>
+        <label class="radio-row"><input type="radio" name="mode" value="device"><span><strong>Play on my computer - recommended</strong><small>Keep Likedle open on your phone while Spotify on your Mac plays the snippets. Reliable with Premium, and the game stays visible on your phone.</small></span></label>
         <div class="device-picker" id="devicePicker" hidden>
           <div class="device-picker-head">
-            <span>Pick a device (open Spotify on it first)</span>
-            <button class="chip-btn" id="refreshDevicesBtn">Refresh</button>
+            <span>Choose a Spotify receiver</span>
+            <div class="device-actions">
+              <a class="chip-btn" href="https://open.spotify.com/" target="_blank" rel="noopener">Open Spotify</a>
+              <button class="chip-btn" id="refreshDevicesBtn">Refresh</button>
+            </div>
           </div>
           <div id="deviceList" class="device-list"></div>
+          <p class="device-help">Computers and speakers are the stable choices. An iPhone may disappear when Spotify is paused or closed because iOS suspends it.</p>
         </div>
+        <label class="radio-row"><input type="radio" name="mode" value="preview"><span><strong>Play directly on this phone or browser</strong><small>Uses 30-second previews from Apple's catalog, without opening Spotify. Works without Premium, but a few songs may be unavailable.</small></span></label>
+        <label class="radio-row"><input type="radio" name="mode" value="browser"><span><strong>Spotify inside this browser - advanced</strong><small>Full-track snippets through Spotify's browser receiver. Needs Premium and a browser that allows protected audio.</small></span></label>
+        <p class="receiver-status" id="receiverStatus" hidden>Browser receiver: Not started</p>
       </div>
 
       <div class="setting-group">
@@ -216,6 +221,6 @@
 
   <div class="toast-wrap" id="toastWrap"></div>
 
-  <script type="module" src="js/main.js?v=4"></script>
+  <script type="module" src="js/main.js?v=5"></script>
 </body>
 </html>
