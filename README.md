@@ -17,13 +17,19 @@ Live at: https://darahaas15.github.io/likedle/
 The Client ID is stored only in your browser's localStorage.
 The OAuth flow is Authorization Code + PKCE, so no client secret exists anywhere.
 
+## Library loading
+
+The game never blocks on syncing a large library.
+On load it fetches a few random pages of your Liked Songs (a fresh random sample every visit) and starts immediately; the full library then syncs quietly in the background so autocomplete and answers eventually cover everything, cached in the browser for future visits.
+"Re-sync Liked Songs" in Settings rebuilds the cache (also in the background).
+
 ## Playback modes
 
-- **In this browser** (default): full-track snippets via the Spotify Web Playback SDK. Requires Spotify Premium. Desktop browsers only.
-- **On a Spotify device**: Likedle remote-controls the Spotify app on your Mac or iPhone via Spotify Connect. Requires Premium. This is the mode to use when playing from an iPhone browser.
-- **30s previews**: matches each track to Apple's public 30-second previews. Works without Premium; a small number of tracks may have no preview (those rounds are re-drawn).
+- **30s previews** (default): matches each track to Apple's public previews, trying your Spotify country's storefront first. Works everywhere - no Premium needed, including iPhone browsers. Rounds whose track has no preview are re-drawn.
+- **In this browser**: full-track snippets via the Spotify Web Playback SDK. Requires Spotify Premium; desktop browsers only.
+- **On a Spotify device**: Likedle remote-controls the Spotify app on your Mac or iPhone via Spotify Connect. Requires Premium.
 
-If the browser player is unavailable (e.g. iOS) or the account is not Premium, the app auto-falls back and tells you.
+Non-Premium accounts are locked to previews (Spotify does not allow playback control otherwise); Premium users get a one-time hint that the full-track modes exist.
 
 ## Development
 

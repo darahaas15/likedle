@@ -1,12 +1,16 @@
-import { STAGES_MS, MAX_GUESSES, loadSettings, saveSettings } from './config.js';
+import {
+  STAGES_MS, MAX_GUESSES, LS, LEGACY_KEYS, TOP_UP_AFTER_MS,
+  loadSettings, saveSettings,
+} from './config.js';
 import {
   getClientId, setClientId, clearClientId, redirectUri, beginLogin,
   handleRedirect, isLoggedIn, logout,
 } from './auth.js';
 import {
-  syncLibrary, getLibrary, getLibrarySyncedAt, getDevices, searchLibrary,
+  loadProfile, fetchAndCacheProfile, getDevices, searchLibrary,
+  fetchQuickBatch, loadLibCache, backgroundSync, topUpLibCache, clearLibCache,
 } from './spotify.js';
-import { playSnippet, stop as stopPlayback } from './player.js';
+import { playSnippet, stop as stopPlayback, primeAudio, findPreviewUrl } from './player.js';
 import { newRound, submitGuess, skip, loadStats, recordResult } from './game.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -14,12 +18,19 @@ const $$ = (sel) => [...document.querySelectorAll(sel)];
 
 const state = {
   settings: loadSettings(),
-  library: null,
+  profile: null,
+  cache: null,        // persistent library cache (fills in the background)
+  quickBatch: null,   // random sample used for answers until the cache completes
+  total: null,        // library size reported by Spotify
+  searchPool: [],     // union of cache + quick batch, for autocomplete
   round: null,
   selectedGuess: null,
   playing: false,
+  poolReady: false,
+  syncGen: 0,
+  syncError: false,
   suggestionIndex: -1,
-  roundsThisSession: 0,
+  uitest: false,
 };
 
 // ---------- Toasts ----------
@@ -49,13 +60,8 @@ function route() {
     showScreen('setup');
   } else if (!isLoggedIn()) {
     showScreen('login');
-  } else if (!getLibrary()) {
-    showScreen('sync');
-    startSync();
   } else {
-    state.library = getLibrary();
-    showScreen('game');
-    startRound();
+    startGame();
   }
 }
 
@@ -93,35 +99,173 @@ $('#changeClientIdBtn').addEventListener('click', () => {
   route();
 });
 
-// ---------- Sync screen ----------
+// ---------- Playback mode resolution ----------
 
-async function startSync() {
-  $('#syncRetryBtn').hidden = true;
-  $('#syncStatus').textContent = 'Contacting Spotify...';
-  $('#syncProgress').style.width = '0%';
-  try {
-    const tracks = await syncLibrary((done, total) => {
-      $('#syncStatus').textContent = `${done.toLocaleString()} / ${total.toLocaleString()} songs`;
-      $('#syncProgress').style.width = `${total ? Math.round((done / total) * 100) : 0}%`;
-    });
-    if (!tracks.length) {
-      $('#syncStatus').textContent = 'Your Liked Songs list is empty - like some songs on Spotify first, then retry.';
-      $('#syncRetryBtn').hidden = false;
-      return;
-    }
-    toast(`Loaded ${tracks.length.toLocaleString()} Liked Songs.`, 'success');
-    route();
-  } catch (e) {
-    if (e.status === 403) {
-      $('#syncStatus').textContent = 'Spotify said "403 Forbidden". If you just created the app, make sure you are logged into the SAME Spotify account that owns it (development mode apps only allow the owner + invited users).';
-    } else {
-      $('#syncStatus').textContent = `Could not load your library: ${e.message}`;
-    }
-    $('#syncRetryBtn').hidden = false;
+function effectiveMode() {
+  if (state.profile && state.profile.product && state.profile.product !== 'premium') {
+    return 'preview'; // Spotify playback control needs Premium
+  }
+  return state.settings.mode || 'preview';
+}
+
+function effectiveSettings() {
+  return {
+    ...state.settings,
+    mode: effectiveMode(),
+    country: state.profile ? state.profile.country : null,
+  };
+}
+
+function modeLabel() {
+  switch (effectiveMode()) {
+    case 'browser': return 'full tracks in this browser';
+    case 'device': return `Spotify on ${state.settings.deviceName || 'a device'}`;
+    default: return '30-second previews';
   }
 }
 
-$('#syncRetryBtn').addEventListener('click', startSync);
+function updateModeLine() {
+  $('#modeLine').textContent = `Sound: ${modeLabel()} - change`;
+}
+
+function maybeShowPremiumHint() {
+  if (
+    state.profile && state.profile.product === 'premium'
+    && !state.settings.mode
+    && !localStorage.getItem(LS.premiumHintShown)
+  ) {
+    localStorage.setItem(LS.premiumHintShown, '1');
+    toast('You have Premium: switch to full-track snippets in Settings if you prefer them over previews.', 'info', 7000);
+  }
+}
+
+// ---------- Library loading (quick start + background sync) ----------
+
+function currentAnswers() {
+  if (state.cache && state.cache.complete && state.cache.tracks.length) return state.cache.tracks;
+  if (state.quickBatch && state.quickBatch.length) return state.quickBatch;
+  return (state.cache && state.cache.tracks) || [];
+}
+
+function rebuildSearchPool() {
+  const seen = new Set();
+  const pool = [];
+  const sources = [state.cache ? state.cache.tracks : [], state.quickBatch || []];
+  for (const src of sources) {
+    for (const t of src) {
+      if (!seen.has(t.id)) { seen.add(t.id); pool.push(t); }
+    }
+  }
+  state.searchPool = pool;
+}
+
+function updateFooter(syncDone, syncTotal) {
+  const foot = $('#gameFoot');
+  const cache = state.cache;
+  if (cache && cache.complete) {
+    foot.textContent = `${cache.tracks.length.toLocaleString()} Liked Songs`;
+  } else if (typeof syncDone === 'number' && syncTotal) {
+    foot.textContent = `Playing from a random sample - syncing your library in the background: ${syncDone.toLocaleString()} / ${syncTotal.toLocaleString()}`;
+  } else if (state.syncError && state.total) {
+    foot.textContent = `Playing from a random sample of your ${state.total.toLocaleString()} Liked Songs`;
+  } else if (state.total) {
+    foot.textContent = `${state.total.toLocaleString()} Liked Songs`;
+  } else {
+    foot.textContent = '';
+  }
+}
+
+function setPoolLoading(loading) {
+  state.poolReady = !loading;
+  $('#playBtn').disabled = loading;
+  $('#skipBtn').disabled = loading;
+  if (loading) $('#playBtnLabel').textContent = 'Loading songs...';
+}
+
+function showLoadError(message) {
+  $('#syncStatus').textContent = message;
+  $('#syncRetryBtn').hidden = false;
+  showScreen('sync');
+}
+
+async function startGame() {
+  showScreen('game');
+  buildTimeline();
+  setPoolLoading(true);
+  $('#modeLine').hidden = true;
+
+  // Profile (Premium? country?) - cached across sessions.
+  if (!state.profile) {
+    state.profile = loadProfile();
+    if (!state.profile) {
+      try { state.profile = await fetchAndCacheProfile(); } catch { state.profile = null; }
+    }
+  }
+
+  try {
+    state.cache = loadLibCache();
+    if (state.cache.complete) {
+      state.total = state.cache.total || state.cache.tracks.length;
+      rebuildSearchPool();
+      poolReady();
+      if (Date.now() - state.cache.updatedAt > TOP_UP_AFTER_MS) {
+        topUpLibCache(state.cache).then((n) => {
+          if (n) { rebuildSearchPool(); updateFooter(); }
+        }).catch(() => {});
+      }
+    } else {
+      // Quick start: a random sample across the whole library, in ~2 requests.
+      const batch = await fetchQuickBatch();
+      if (!batch.total) {
+        showLoadError('Your Liked Songs list is empty - like some songs on Spotify first, then retry.');
+        return;
+      }
+      state.quickBatch = batch.tracks;
+      state.total = batch.total;
+      rebuildSearchPool();
+      poolReady();
+      runBackgroundSync();
+    }
+  } catch (e) {
+    if (e.status === 403) {
+      showLoadError('Spotify said "403 Forbidden". If you just created the app, make sure you are logged into the SAME Spotify account that owns it (development mode apps only allow the owner + invited users).');
+    } else {
+      showLoadError(`Could not load your Liked Songs: ${e.message}`);
+    }
+  }
+}
+
+function poolReady() {
+  setPoolLoading(false);
+  $('#modeLine').hidden = false;
+  updateModeLine();
+  maybeShowPremiumHint();
+  startRound();
+}
+
+function runBackgroundSync() {
+  const gen = ++state.syncGen;
+  state.syncError = false;
+  backgroundSync(state.cache, {
+    shouldContinue: () => gen === state.syncGen,
+    onProgress: (done, total, complete) => {
+      if (gen !== state.syncGen) return;
+      state.total = total;
+      rebuildSearchPool();
+      updateFooter(done, total);
+      if (complete) updateFooter();
+    },
+  }).catch(() => {
+    if (gen !== state.syncGen) return;
+    state.syncError = true;
+    updateFooter();
+  });
+}
+
+$('#syncRetryBtn').addEventListener('click', () => {
+  $('#syncRetryBtn').hidden = true;
+  startGame();
+});
 
 // ---------- Game: rendering ----------
 
@@ -152,9 +296,10 @@ function renderGuessRows() {
   list.innerHTML = '';
   for (let i = 0; i < MAX_GUESSES; i++) {
     const li = document.createElement('li');
-    const g = state.round.guesses[i];
+    const g = state.round ? state.round.guesses[i] : null;
     if (!g) {
-      li.className = `guess-row empty${i === state.round.guesses.length && state.round.status === 'playing' ? ' current' : ''}`;
+      const isCurrent = state.round && i === state.round.guesses.length && state.round.status === 'playing';
+      li.className = `guess-row empty${isCurrent ? ' current' : ''}`;
       li.innerHTML = '<span class="guess-dot"></span>';
     } else if (g.type === 'skip') {
       li.className = 'guess-row skipped';
@@ -174,6 +319,7 @@ function renderGuessRows() {
 
 function updateStageUi() {
   const round = state.round;
+  if (!round) return;
   const totalMs = STAGES_MS[STAGES_MS.length - 1];
   const unlockedMs = STAGES_MS[Math.min(round.stage, STAGES_MS.length - 1)];
   const unlockedPct = (unlockedMs / totalMs) * 100;
@@ -182,11 +328,7 @@ function updateStageUi() {
 
   const next = STAGES_MS[round.stage + 1];
   $('#skipBtn').textContent = next ? `Skip (+${(next - unlockedMs) / 1000}s)` : 'Give up';
-
-  const synced = getLibrarySyncedAt();
-  $('#gameFoot').textContent =
-    `${state.library.length.toLocaleString()} Liked Songs` +
-    (synced ? ` - synced ${new Date(synced).toLocaleDateString()}` : '');
+  updateFooter();
 }
 
 function resetFill() {
@@ -216,21 +358,23 @@ function animateFill(durMs) {
 
 function startRound() {
   stopPlayback();
-  state.round = newRound(state.library, state.settings);
+  const answers = currentAnswers();
+  if (!answers.length) return;
+  state.round = newRound(answers, state.settings);
   state.selectedGuess = null;
-  state.roundsThisSession += 1;
   $('#revealCard').hidden = true;
   $('#controls').hidden = false;
   $('#guessInput').value = '';
   $('#submitBtn').disabled = true;
   hideSuggestions();
-  buildTimeline();
   renderGuessRows();
   updateStageUi();
   setPlayingUi(false);
 }
 
 async function onPlay() {
+  if (!state.round) return;
+  primeAudio(); // synchronous, inside the gesture: unlocks audio on iOS
   if (state.playing) {
     await stopPlayback();
     setPlayingUi(false);
@@ -243,7 +387,7 @@ async function onPlay() {
   const btn = $('#playBtn');
   btn.disabled = true;
   try {
-    await playSnippet(round.track, round.startMs, durMs, state.settings, () => setPlayingUi(false));
+    await playSnippet(round.track, round.startMs, durMs, effectiveSettings(), () => setPlayingUi(false));
     setPlayingUi(true);
     animateFill(durMs);
   } catch (e) {
@@ -257,18 +401,20 @@ function handlePlayError(e) {
   setPlayingUi(false);
   switch (e.code) {
     case 'premium':
-      state.settings.mode = 'preview';
+      state.settings.mode = null;
       saveSettings(state.settings);
-      toast('Spotify Premium is needed for full-track snippets. Switched to 30s previews - press play again.', 'error', 6500);
+      updateModeLine();
+      toast('Spotify Premium is needed for that mode. Switched to 30s previews - press play again.', 'error', 6000);
       break;
     case 'init':
       state.settings.mode = 'device';
       saveSettings(state.settings);
+      updateModeLine();
       toast('The in-browser player is not supported here. Pick a Spotify device in Settings (open Spotify on your Mac/iPhone first).', 'error', 7000);
       openSettings();
       break;
     case 'auth':
-      toast('Spotify rejected the web player session. If you just created the Spotify app, make sure "Web Playback SDK" is ticked in its settings.', 'error', 7000);
+      toast('Spotify rejected the web player session. Check that "Web Playback SDK" is ticked in your Spotify app settings, or switch to previews in Settings.', 'error', 7000);
       break;
     case 'no-device':
       toast(e.message, 'error', 6000);
@@ -276,16 +422,11 @@ function handlePlayError(e) {
       break;
     case 'no-preview':
       toast('No preview found for this song - drawing another one.', 'info');
-      finishRoundSilently();
+      startRound();
       break;
     default:
       toast(`Playback failed: ${e.message}`, 'error', 6000);
   }
-}
-
-// Used when preview mode cannot play the drawn track: abandon without stats.
-function finishRoundSilently() {
-  startRound();
 }
 
 function endRound() {
@@ -333,13 +474,13 @@ function afterAttempt() {
 $('#playBtn').addEventListener('click', onPlay);
 
 $('#skipBtn').addEventListener('click', () => {
-  if (state.round.status !== 'playing') return;
+  if (!state.round || state.round.status !== 'playing') return;
   skip(state.round);
   afterAttempt();
 });
 
 $('#submitBtn').addEventListener('click', () => {
-  if (!state.selectedGuess || state.round.status !== 'playing') return;
+  if (!state.selectedGuess || !state.round || state.round.status !== 'playing') return;
   submitGuess(state.round, state.selectedGuess);
   state.selectedGuess = null;
   $('#guessInput').value = '';
@@ -349,6 +490,7 @@ $('#submitBtn').addEventListener('click', () => {
 });
 
 $('#nextBtn').addEventListener('click', startRound);
+$('#modeLine').addEventListener('click', () => openSettings());
 
 // ---------- Suggestions ----------
 
@@ -392,7 +534,7 @@ $('#guessInput').addEventListener('input', () => {
   $('#submitBtn').disabled = true;
   const q = $('#guessInput').value;
   if (q.trim().length < 2) { hideSuggestions(); return; }
-  renderSuggestions(searchLibrary(state.library, q));
+  renderSuggestions(searchLibrary(state.searchPool, q));
 });
 
 $('#guessInput').addEventListener('keydown', (e) => {
@@ -423,18 +565,31 @@ document.addEventListener('click', (e) => {
 // ---------- Settings modal ----------
 
 function openSettings() {
-  $$('input[name="mode"]').forEach((r) => { r.checked = r.value === state.settings.mode; });
+  const isFree = state.profile && state.profile.product && state.profile.product !== 'premium';
+  const mode = effectiveMode();
+  $$('input[name="mode"]').forEach((r) => {
+    r.checked = r.value === mode;
+    r.disabled = isFree && r.value !== 'preview';
+    r.closest('.radio-row').classList.toggle('disabled', isFree && r.value !== 'preview');
+  });
+  $('#premiumNote').hidden = !isFree;
   $$('input[name="snippetStart"]').forEach((r) => { r.checked = r.value === state.settings.snippetStart; });
   toggleDevicePicker();
-  const synced = getLibrarySyncedAt();
-  $('#libraryInfo').textContent = state.library
-    ? `${state.library.length.toLocaleString()} songs, synced ${synced ? new Date(synced).toLocaleString() : 'never'}. Liked something new? Re-sync to include it.`
-    : 'Library not synced yet.';
+  const cache = state.cache;
+  let info = '';
+  if (cache && cache.complete) {
+    info = `${cache.tracks.length.toLocaleString()} songs cached, updated ${new Date(cache.updatedAt).toLocaleString()}. Liked something new? Re-sync to include it.`;
+  } else if (state.total) {
+    info = `Playing from a random sample while your ${state.total.toLocaleString()} Liked Songs sync in the background.`;
+  } else {
+    info = 'Library not loaded yet.';
+  }
+  $('#libraryInfo').textContent = info;
   $('#settingsModal').hidden = false;
 }
 
 function toggleDevicePicker() {
-  const show = state.settings.mode === 'device';
+  const show = effectiveMode() === 'device';
   $('#devicePicker').hidden = !show;
   if (show) refreshDevices();
 }
@@ -446,7 +601,7 @@ async function refreshDevices() {
     const devices = await getDevices();
     list.innerHTML = '';
     if (!devices.length) {
-      list.innerHTML = '<div class="device-empty">No devices found. Open the Spotify app on your Mac or iPhone (and start/pause any song once so it registers), then hit Refresh.</div>';
+      list.innerHTML = '<div class="device-empty">No devices found. Open the Spotify app on your Mac or iPhone, play and pause any song once so it registers, then hit Refresh.</div>';
       return;
     }
     devices.forEach((d) => {
@@ -461,11 +616,12 @@ async function refreshDevices() {
         saveSettings(state.settings);
         $$('.device-item').forEach((el) => el.classList.remove('selected'));
         btn.classList.add('selected');
+        updateModeLine();
         toast(`Snippets will play on "${d.name}".`, 'success');
       });
       list.appendChild(btn);
     });
-  } catch (e) {
+  } catch {
     list.innerHTML = '<div class="device-empty">Could not load devices.</div>';
   }
 }
@@ -476,6 +632,7 @@ $('#refreshDevicesBtn').addEventListener('click', refreshDevices);
 $$('input[name="mode"]').forEach((r) => r.addEventListener('change', () => {
   state.settings.mode = r.value;
   saveSettings(state.settings);
+  updateModeLine();
   toggleDevicePicker();
 }));
 
@@ -487,8 +644,12 @@ $$('input[name="snippetStart"]').forEach((r) => r.addEventListener('change', () 
 
 $('#resyncBtn').addEventListener('click', () => {
   $('#settingsModal').hidden = true;
-  showScreen('sync');
-  startSync();
+  state.syncGen += 1; // cancel any running sync
+  clearLibCache();
+  state.cache = null;
+  state.quickBatch = null;
+  toast('Re-syncing your library in the background.', 'info');
+  startGame();
 });
 
 $('#logoutBtn').addEventListener('click', () => logout());
@@ -525,7 +686,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') $$('.modal-backdrop').forEach((m) => { m.hidden = true; });
 });
 
-// ---------- UI test harness (no Spotify needed; ?uitest=fresh|mid|reveal) ----------
+// ---------- UI test harness (no Spotify needed; ?uitest=fresh|mid|reveal|probe) ----------
 
 function runUiTest(kind) {
   const art = (hue) => `data:image/svg+xml,${encodeURIComponent(
@@ -536,32 +697,71 @@ function runUiTest(kind) {
     artists: [{ id: artistId, name: artistName }], durMs: 210000, art: art(hue),
   });
   state.uitest = true;
-  state.library = [
+  state.profile = { product: 'premium', country: 'US', name: 'UI Test' };
+  const tracks = [
     mk('t1', 'Pyramids', 'fo', 'Frank Ocean', 140),
     mk('t2', 'Nights', 'fo', 'Frank Ocean', 20),
     mk('t3', 'Alright', 'kl', 'Kendrick Lamar', 260),
     mk('t4', 'Ivy', 'fo', 'Frank Ocean', 80),
     mk('t5', 'Money Trees', 'kl', 'Kendrick Lamar', 320),
   ];
+  state.cache = { tracks, nextOffset: 250, total: tracks.length, complete: true, updatedAt: Date.now() };
+  state.total = tracks.length;
   showScreen('game');
+  buildTimeline();
+  rebuildSearchPool();
+  setPoolLoading(false);
+  $('#modeLine').hidden = false;
+  updateModeLine();
+  if (kind === 'probe') { runPreviewProbe(); return; }
   startRound();
-  state.round.track = state.library[0];
+  state.round.track = tracks[0];
   if (kind === 'mid' || kind === 'reveal') {
-    submitGuess(state.round, state.library[2]); // wrong artist
+    submitGuess(state.round, tracks[2]); // wrong artist
     skip(state.round);
-    submitGuess(state.round, state.library[1]); // right artist, wrong song
+    submitGuess(state.round, tracks[1]); // right artist, wrong song
     renderGuessRows();
     updateStageUi();
   }
   if (kind === 'reveal') {
-    submitGuess(state.round, state.library[0]);
+    submitGuess(state.round, tracks[0]);
     endRound();
   }
+}
+
+// Real end-to-end check of the preview pipeline (JSONP lookups + audio.play)
+// from whatever origin the app is served on. Renders results into the page.
+async function runPreviewProbe() {
+  const out = document.createElement('pre');
+  out.id = 'probeOut';
+  out.style.cssText = 'white-space:pre-wrap;font-size:13px;line-height:1.6;color:#eef1f6;background:#12151c;border:1px solid #242b38;padding:16px;border-radius:10px;';
+  $('.game-col') ? $('.game-col').prepend(out) : document.body.prepend(out);
+  const log = (s) => { out.textContent += `${s}\n`; };
+  const tests = [
+    { id: 'probe_a', name: 'Blinding Lights', artists: [{ id: 'x1', name: 'The Weeknd' }] },
+    { id: 'probe_b', name: 'Tum Hi Ho', artists: [{ id: 'x2', name: 'Arijit Singh' }] },
+    { id: 'probe_c', name: 'Kesariya', artists: [{ id: 'x3', name: 'Arijit Singh' }] },
+  ];
+  for (const t of tests) {
+    try {
+      const url = await findPreviewUrl(t, 'IN');
+      if (!url) { log(`${t.name}: NO MATCH`); continue; }
+      const a = new Audio(url);
+      await a.play();
+      await new Promise((r) => setTimeout(r, 500));
+      log(`${t.name}: FOUND, playing=${!a.paused}, position=${a.currentTime.toFixed(2)}s`);
+      a.pause();
+    } catch (e) {
+      log(`${t.name}: ERROR ${e.message}`);
+    }
+  }
+  log('PROBE DONE');
 }
 
 // ---------- Boot ----------
 
 (async function boot() {
+  LEGACY_KEYS.forEach((k) => localStorage.removeItem(k));
   buildTimeline();
   const uitest = new URLSearchParams(window.location.search).get('uitest');
   if (uitest !== null) {

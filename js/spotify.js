@@ -1,4 +1,4 @@
-import { LS } from './config.js';
+import { LS, PAGE_SIZE, QUICK_BATCH_PAGES, BG_SYNC_DELAY_MS, MAX_CACHE_TRACKS } from './config.js';
 import { getAccessToken, invalidateAccessToken } from './auth.js';
 
 const API = 'https://api.spotify.com/v1';
@@ -34,9 +34,24 @@ export async function apiFetch(path, opts = {}, retried = false) {
   return text ? JSON.parse(text) : null;
 }
 
-export function getProfile() {
-  return apiFetch('/me');
+// ---------- Profile ----------
+
+export function loadProfile() {
+  try {
+    return JSON.parse(localStorage.getItem(LS.profile));
+  } catch {
+    return null;
+  }
 }
+
+export async function fetchAndCacheProfile() {
+  const p = await apiFetch('/me');
+  const slim = { product: p.product || null, country: p.country || null, name: p.display_name || null };
+  localStorage.setItem(LS.profile, JSON.stringify(slim));
+  return slim;
+}
+
+// ---------- Playback devices ----------
 
 export async function getDevices() {
   const data = await apiFetch('/me/player/devices');
@@ -54,48 +69,131 @@ export function pauseOnDevice(deviceId) {
   return apiFetch(`/me/player/pause?device_id=${encodeURIComponent(deviceId)}`, { method: 'PUT' });
 }
 
-// ---------- Library ----------
+// ---------- Library pages ----------
 
-export async function syncLibrary(onProgress) {
+function mapItems(items) {
   const tracks = [];
-  let offset = 0;
-  let total = Infinity;
-  while (offset < total) {
-    const page = await apiFetch(`/me/tracks?limit=50&offset=${offset}`);
-    total = page.total;
-    for (const item of page.items) {
-      const t = item.track;
-      if (!t || t.is_local || !t.id) continue;
-      tracks.push({
-        id: t.id,
-        uri: t.uri,
-        name: t.name,
-        artists: t.artists.map((a) => ({ id: a.id, name: a.name })),
-        durMs: t.duration_ms,
-        art: (t.album && (t.album.images[1] || t.album.images[0]) || {}).url || null,
-      });
-    }
-    offset += page.items.length;
-    if (onProgress) onProgress(Math.min(offset, total), total);
-    if (!page.items.length) break;
+  for (const item of items) {
+    const t = item.track;
+    if (!t || t.is_local || !t.id) continue;
+    tracks.push({
+      id: t.id,
+      uri: t.uri,
+      name: t.name,
+      artists: t.artists.map((a) => ({ id: a.id, name: a.name })),
+      durMs: t.duration_ms,
+      art: (t.album && (t.album.images[1] || t.album.images[0]) || {}).url || null,
+    });
   }
-  localStorage.setItem(LS.library, JSON.stringify(tracks));
-  localStorage.setItem(LS.librarySyncedAt, String(Date.now()));
   return tracks;
 }
 
-export function getLibrary() {
+export async function fetchLibraryPage(offset, limit = PAGE_SIZE) {
+  const page = await apiFetch(`/me/tracks?limit=${limit}&offset=${offset}`);
+  return { tracks: mapItems(page.items), total: page.total, count: page.items.length };
+}
+
+// Spread `pages` non-overlapping windows of `pageSize` randomly across the
+// library, so quick-batch answers are unbiased across the whole collection.
+export function pickRandomOffsets(total, pages = QUICK_BATCH_PAGES, pageSize = PAGE_SIZE) {
+  if (total <= 0) return [];
+  if (total <= pages * pageSize) {
+    return Array.from({ length: Math.ceil(total / pageSize) }, (_, i) => i * pageSize);
+  }
+  const maxOffset = total - pageSize;
+  const offsets = [];
+  let guard = 0;
+  while (offsets.length < pages && guard++ < 60) {
+    const o = Math.floor(Math.random() * (maxOffset + 1));
+    if (offsets.every((x) => Math.abs(x - o) >= pageSize)) offsets.push(o);
+  }
+  return offsets;
+}
+
+// A fast random sample of the library: 1 request for the total, then a few
+// random pages in parallel. Playable in a second or two even for huge libraries.
+export async function fetchQuickBatch() {
+  const first = await fetchLibraryPage(0, 1);
+  const total = first.total;
+  if (!total) return { total: 0, tracks: [] };
+  const offsets = pickRandomOffsets(total);
+  const results = await Promise.all(
+    offsets.map((o) => fetchLibraryPage(o).catch(() => ({ tracks: [] }))),
+  );
+  const seen = new Set();
+  const tracks = [];
+  for (const r of results) {
+    for (const t of r.tracks) {
+      if (!seen.has(t.id)) { seen.add(t.id); tracks.push(t); }
+    }
+  }
+  return { total, tracks };
+}
+
+// ---------- Persistent library cache (filled in the background) ----------
+
+export function loadLibCache() {
   try {
-    const lib = JSON.parse(localStorage.getItem(LS.library));
-    return Array.isArray(lib) && lib.length ? lib : null;
+    const c = JSON.parse(localStorage.getItem(LS.libcache));
+    if (c && Array.isArray(c.tracks)) return c;
+  } catch { /* fall through */ }
+  return { tracks: [], nextOffset: 0, total: null, complete: false, updatedAt: 0 };
+}
+
+export function saveLibCache(cache) {
+  cache.updatedAt = Date.now();
+  try {
+    localStorage.setItem(LS.libcache, JSON.stringify(cache));
   } catch {
-    return null;
+    // Quota exceeded: keep playing from memory; stop persisting.
   }
 }
 
-export function getLibrarySyncedAt() {
-  const v = localStorage.getItem(LS.librarySyncedAt);
-  return v ? parseInt(v, 10) : null;
+export function clearLibCache() {
+  localStorage.removeItem(LS.libcache);
+}
+
+// Sequentially fills the cache page by page. Never blocks the game; call
+// without awaiting. `shouldContinue` lets the caller cancel (e.g. re-sync).
+export async function backgroundSync(cache, { onProgress, shouldContinue } = {}) {
+  while (!cache.complete) {
+    if (shouldContinue && !shouldContinue()) return cache;
+    const { tracks, total, count } = await fetchLibraryPage(cache.nextOffset);
+    cache.total = total;
+    const seen = new Set(cache.tracks.map((t) => t.id));
+    for (const t of tracks) {
+      if (!seen.has(t.id)) cache.tracks.push(t);
+    }
+    cache.nextOffset += PAGE_SIZE;
+    if (cache.nextOffset >= total || count === 0 || cache.tracks.length >= MAX_CACHE_TRACKS) {
+      cache.complete = true;
+    }
+    saveLibCache(cache);
+    if (onProgress) onProgress(Math.min(cache.nextOffset, total), total, cache.complete);
+    if (!cache.complete) await new Promise((r) => setTimeout(r, BG_SYNC_DELAY_MS));
+  }
+  return cache;
+}
+
+// Picks up songs liked since the last full sync (saved tracks are returned
+// newest-first, so new likes appear at the front). Cheap: usually 1 request.
+export async function topUpLibCache(cache, maxPages = 5) {
+  const ids = new Set(cache.tracks.map((t) => t.id));
+  const fresh = [];
+  for (let p = 0; p < maxPages; p++) {
+    const { tracks, total, count } = await fetchLibraryPage(p * PAGE_SIZE);
+    cache.total = total;
+    const newOnes = tracks.filter((t) => !ids.has(t.id));
+    fresh.push(...newOnes);
+    if (newOnes.length < tracks.length || count === 0) break;
+  }
+  if (fresh.length) {
+    cache.tracks = [...fresh, ...cache.tracks];
+    saveLibCache(cache);
+  } else {
+    saveLibCache(cache); // refresh updatedAt so we do not re-check every load
+  }
+  return fresh.length;
 }
 
 // ---------- Search / matching helpers ----------

@@ -16,6 +16,8 @@ function codedError(code, message) {
   return err;
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // ---------- Web Playback SDK (browser mode) ----------
 
 let sdkPlayer = null;
@@ -69,13 +71,43 @@ function initSdk() {
       }
     }
   });
-  sdkReadyPromise.catch(() => { sdkReadyPromise = null; sdkPlayer = null; });
+  sdkReadyPromise.catch(() => {
+    if (sdkPlayer) { try { sdkPlayer.disconnect(); } catch { /* best-effort */ } }
+    sdkReadyPromise = null;
+    sdkPlayer = null;
+  });
   return sdkReadyPromise;
 }
 
-// ---------- iTunes 30s previews (fallback mode) ----------
+// Right after `ready`, the SDK device sometimes is not yet visible to the Web
+// API and the play command 404s. Retry briefly before giving up.
+async function playWithRetry(deviceId, uri, positionMs) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await apiFetch(`/me/player/play?device_id=${encodeURIComponent(deviceId)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ uris: [uri], position_ms: Math.max(0, Math.round(positionMs)) }),
+      });
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (e.status === 404 || e.status === 502) {
+        await sleep(500 * (attempt + 1));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+
+// ---------- iTunes 30s previews (default mode, no Premium needed) ----------
 
 let audioEl = null;
+let audioPrimed = false;
+
+const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
 
 function jsonp(url) {
   return new Promise((resolve, reject) => {
@@ -84,7 +116,7 @@ function jsonp(url) {
     const cleanup = () => { delete window[cb]; script.remove(); clearTimeout(timer); };
     const timer = setTimeout(() => { cleanup(); reject(new Error('Preview lookup timed out')); }, 10000);
     window[cb] = (data) => { cleanup(); resolve(data); };
-    script.src = `${url}&callback=${cb}`;
+    script.src = `${url}${url.includes('?') ? '&' : '?'}callback=${cb}`;
     script.onerror = () => { cleanup(); reject(new Error('Preview lookup failed')); };
     document.head.appendChild(script);
   });
@@ -99,32 +131,52 @@ function savePreviewCache(cache) {
   if (keys.length > 600) {
     for (const k of keys.slice(0, keys.length - 600)) delete cache[k];
   }
-  localStorage.setItem(LS.previewCache, JSON.stringify(cache));
+  try { localStorage.setItem(LS.previewCache, JSON.stringify(cache)); } catch { /* quota */ }
 }
 
-async function getPreviewUrl(track) {
-  const cache = loadPreviewCache();
-  if (track.id in cache) return cache[track.id] || null;
+function matchFromResults(track, results) {
+  const wantName = normalize(track.name);
+  const wantArtist = normalize(track.artists[0] ? track.artists[0].name : '');
+  for (const r of results) {
+    if (!r.url) continue;
+    const gotName = normalize(r.name || '');
+    const gotArtist = normalize(r.artist || '');
+    const nameOk = gotName === wantName || gotName.includes(wantName) || wantName.includes(gotName);
+    const artistOk = !wantArtist || gotArtist.includes(wantArtist) || wantArtist.includes(gotArtist);
+    if (nameOk && artistOk) return r.url;
+  }
+  return null;
+}
+
+async function lookupItunes(track, country) {
   const artist = track.artists[0] ? track.artists[0].name : '';
   const term = encodeURIComponent(`${track.name} ${artist}`);
+  const cc = country ? `&country=${encodeURIComponent(country)}` : '';
+  const data = await jsonp(`https://itunes.apple.com/search?media=music&entity=song&limit=8${cc}&term=${term}`);
+  return matchFromResults(track, (data.results || []).map((r) => ({
+    name: r.trackName, artist: r.artistName, url: r.previewUrl,
+  })));
+}
+
+// Tries the user's Spotify country storefront first (better regional catalog
+// coverage), then the default US storefront. Exported for the UI test probe.
+export async function findPreviewUrl(track, country) {
+  const cache = loadPreviewCache();
+  if (track.id in cache) return cache[track.id] || null;
+  const storefronts = [...new Set([country || null, null])];
+  let anySourceAnswered = false;
   let url = null;
-  try {
-    const data = await jsonp(`https://itunes.apple.com/search?media=music&entity=song&limit=8&term=${term}`);
-    const wantName = normalize(track.name);
-    const wantArtist = normalize(artist);
-    for (const r of data.results || []) {
-      if (!r.previewUrl) continue;
-      const gotName = normalize(r.trackName || '');
-      const gotArtist = normalize(r.artistName || '');
-      const nameOk = gotName === wantName || gotName.includes(wantName) || wantName.includes(gotName);
-      const artistOk = !wantArtist || gotArtist.includes(wantArtist) || wantArtist.includes(gotArtist);
-      if (nameOk && artistOk) { url = r.previewUrl; break; }
-    }
-  } catch {
-    return null; // lookup failure: do not cache, may work next time
+  for (const cc of storefronts) {
+    try {
+      url = await lookupItunes(track, cc);
+      anySourceAnswered = true;
+      if (url) break;
+    } catch { /* try the next storefront */ }
   }
-  cache[track.id] = url || 0;
-  savePreviewCache(cache);
+  if (anySourceAnswered) {
+    cache[track.id] = url || 0;
+    savePreviewCache(cache);
+  }
   return url;
 }
 
@@ -136,10 +188,22 @@ function ensureAudio() {
   return audioEl;
 }
 
+// Must be called synchronously inside a user-gesture handler once, so that
+// later programmatic play() calls are allowed on iOS Safari.
+export function primeAudio() {
+  if (audioPrimed) return;
+  audioPrimed = true;
+  const a = ensureAudio();
+  a.src = SILENT_WAV;
+  const p = a.play();
+  if (p && p.then) p.then(() => a.pause()).catch(() => {});
+}
+
 // ---------- Public interface ----------
 
 let stopTimer = null;
 let playToken = 0; // invalidates stale scheduled stops
+let current = null; // { mode, deviceId }
 
 async function stopEngine(mode, deviceId) {
   try {
@@ -149,17 +213,15 @@ async function stopEngine(mode, deviceId) {
   } catch { /* pausing best-effort */ }
 }
 
-let current = null; // { mode, deviceId }
-
 export async function stop() {
   playToken += 1;
   if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
   if (current) await stopEngine(current.mode, current.deviceId);
 }
 
-// Plays `durMs` of the track starting at `startMs`, per settings.
-// Resolves (with {durMs}) once playback has started; auto-stops after durMs.
-// onEnded is called when the snippet finishes on its own.
+// Plays `durMs` of the track starting at `startMs`, per settings
+// ({mode, deviceId, deviceName, country}). Resolves once playback started;
+// auto-stops after durMs; onEnded fires when the snippet finishes on its own.
 export async function playSnippet(track, startMs, durMs, settings, onEnded) {
   await stop();
   const token = ++playToken;
@@ -171,10 +233,7 @@ export async function playSnippet(track, startMs, durMs, settings, onEnded) {
       try { await sdkPlayer.activateElement(); } catch { /* older SDK */ }
     }
     try {
-      await apiFetch(`/me/player/play?device_id=${encodeURIComponent(deviceId)}`, {
-        method: 'PUT',
-        body: JSON.stringify({ uris: [track.uri], position_ms: startMs }),
-      });
+      await playWithRetry(deviceId, track.uri, startMs);
     } catch (e) {
       if (e.status === 403) throw codedError('premium', 'Spotify Premium is required to play snippets.');
       if (e.status === 404) { sdkDeviceId = null; sdkReadyPromise = null; throw codedError('init', 'The web player disconnected - try again.'); }
@@ -190,7 +249,7 @@ export async function playSnippet(track, startMs, durMs, settings, onEnded) {
     try {
       await playOnDevice(settings.deviceId, track.uri, startMs);
     } catch (e) {
-      if (e.status === 404) throw codedError('no-device', `"${settings.deviceName || 'Your device'}" is not available. Open Spotify on it, then re-pick it in Settings.`);
+      if (e.status === 404) throw codedError('no-device', `"${settings.deviceName || 'Your device'}" is not available. Open Spotify on it (play/pause any song once), then re-pick it in Settings.`);
       if (e.status === 403) throw codedError('premium', 'Spotify Premium is required to control playback.');
       throw e;
     }
@@ -200,7 +259,7 @@ export async function playSnippet(track, startMs, durMs, settings, onEnded) {
   }
 
   // preview mode
-  const url = await getPreviewUrl(track);
+  const url = await findPreviewUrl(track, settings.country);
   if (!url) throw codedError('no-preview', 'No 30s preview exists for this track.');
   const audio = ensureAudio();
   if (audio.src !== url) {
@@ -237,5 +296,4 @@ function scheduleStop(token, afterMs, onEnded) {
   }, afterMs);
 }
 
-// Devices helper re-exported for the settings UI.
 export { initSdk };
