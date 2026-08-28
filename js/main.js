@@ -342,6 +342,16 @@ function setPlayingUi(playing) {
   state.playing = playing;
   $('#playBtn').querySelector('.ic-play').hidden = playing;
   $('#playBtn').querySelector('.ic-stop').hidden = !playing;
+  const label = $('#playBtnLabel');
+  if (playing) {
+    label.textContent = 'Stop';
+  } else if (state.round) {
+    const totalMs = STAGES_MS[STAGES_MS.length - 1];
+    const unlockedMs = state.round.status === 'playing'
+      ? STAGES_MS[Math.min(state.round.stage, STAGES_MS.length - 1)]
+      : totalMs;
+    label.textContent = `Play ${unlockedMs / 1000}s`;
+  }
   if (!playing) resetFill();
 }
 
@@ -386,6 +396,7 @@ async function onPlay() {
     : STAGES_MS[STAGES_MS.length - 1];
   const btn = $('#playBtn');
   btn.disabled = true;
+  $('#playBtnLabel').textContent = 'Starting...';
   try {
     await playSnippet(round.track, round.startMs, durMs, effectiveSettings(), () => setPlayingUi(false));
     setPlayingUi(true);
@@ -394,6 +405,7 @@ async function onPlay() {
     handlePlayError(e);
   } finally {
     btn.disabled = false;
+    if (!state.playing) setPlayingUi(false); // restores the Play label on failure
   }
 }
 
