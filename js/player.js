@@ -575,7 +575,12 @@ export function primeAudio() {
 
 let stopTimer = null;
 let playToken = 0; // invalidates stale scheduled stops
+let previewPlayToken = 0; // owns the shared Audio element during async play()
 let current = null; // { mode, deviceId }
+
+function throwIfCanceled(token) {
+  if (token !== playToken) throw codedError('canceled', 'Playback canceled');
+}
 
 async function stopEngine(mode, deviceId) {
   try {
@@ -618,6 +623,7 @@ export async function playSnippet(track, startMs, durMs, settings, onEnded) {
 
   // preview mode
   const url = await findPreviewUrl(track, settings.country);
+  throwIfCanceled(token);
   if (!url) throw codedError('no-preview', 'No 30s preview exists for this track.');
   const audio = ensureAudio();
   if (audio.src !== url) {
@@ -635,13 +641,26 @@ export async function playSnippet(track, startMs, durMs, settings, onEnded) {
       audio.addEventListener('error', bad);
       audio.load();
     });
+    throwIfCanceled(token);
   }
   // Previews are ~30s; keep the snippet window inside them.
   const maxStart = Math.max(0, 29000 - durMs);
   audio.currentTime = Math.min(startMs, maxStart) / 1000;
-  await audio.play();
+  throwIfCanceled(token);
+  previewPlayToken = token;
+  current = { mode, deviceId: null, token };
+  try {
+    await audio.play();
+  } catch (error) {
+    if (current && current.token === token) current = null;
+    if (token !== playToken) throw codedError('canceled', 'Playback canceled');
+    throw error;
+  }
+  if (token !== playToken) {
+    if (previewPlayToken === token) audio.pause();
+    throw codedError('canceled', 'Playback canceled');
+  }
   maskMediaSession();
-  current = { mode, deviceId: null };
   scheduleStop(token, durMs, onEnded);
   return { durMs };
 }

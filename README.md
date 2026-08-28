@@ -34,6 +34,7 @@ On load it fetches a few random pages of your Liked Songs (a fresh random sample
 
 Non-Premium accounts are locked to previews (Spotify does not allow playback control otherwise); Premium users get a one-time hint that the full-track modes exist.
 Spotify on an iPhone is only a best-effort remote receiver because iOS can suspend it when playback is paused or the Spotify app is closed.
+The game and Settings show playback readiness, and Settings includes a one-second sound test that does not consume a guess.
 
 ## Development
 

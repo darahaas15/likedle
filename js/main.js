@@ -38,6 +38,16 @@ const state = {
   suggestionIndex: -1,
   previewGeneration: 0,
   browserReceiver: getBrowserReceiverStatus(),
+  playbackHealth: {
+    status: 'idle',
+    shortLabel: 'not checked',
+    title: 'Sound not checked',
+    message: 'Likedle will check your selected playback option.',
+  },
+  healthGeneration: 0,
+  deviceListGeneration: 0,
+  soundTestGeneration: 0,
+  testingSound: false,
   uitest: false,
 };
 
@@ -129,27 +139,122 @@ function effectiveSettings() {
 
 function modeLabel() {
   switch (effectiveMode()) {
-    case 'browser': return `this browser via Spotify - ${state.browserReceiver.message.toLowerCase()}`;
+    case 'browser': return 'this browser via Spotify';
     case 'device': return `Spotify on ${state.settings.deviceName || 'your computer'}`;
     default: return 'this device using 30-second previews';
   }
 }
 
 function updateModeLine() {
-  $('#modeLine').textContent = `Sound: ${modeLabel()} - change`;
-  $('#modeLine').dataset.status = effectiveMode() === 'browser'
-    ? state.browserReceiver.state
-    : 'ready';
+  $('#modeLine').textContent = `Sound: ${modeLabel()} - ${state.playbackHealth.shortLabel} - change`;
+  $('#modeLine').dataset.status = state.playbackHealth.status;
+}
+
+function setPlaybackHealth(status, shortLabel, title, message) {
+  state.playbackHealth = { status, shortLabel, title, message };
+  const panel = $('#playbackHealth');
+  if (panel) {
+    panel.dataset.status = status;
+    $('#healthTitle').textContent = title;
+    $('#healthMessage').textContent = message;
+  }
+  if ($('#modeLine')) updateModeLine();
 }
 
 onBrowserReceiverStatus((status) => {
   state.browserReceiver = status;
-  if ($('#modeLine') && effectiveMode() === 'browser') updateModeLine();
-  if ($('#receiverStatus')) {
-    $('#receiverStatus').textContent = `Browser receiver: ${status.message}`;
-    $('#receiverStatus').dataset.status = status.state;
+  if (effectiveMode() !== 'browser') return;
+  if (status.state === 'connecting') {
+    setPlaybackHealth('checking', 'connecting', 'Connecting browser audio', status.message);
+  } else if (status.state === 'ready') {
+    setPlaybackHealth('ready', 'ready', 'Browser audio ready', status.message);
+  } else if (status.state === 'playing') {
+    setPlaybackHealth('ready', 'playing', 'Browser audio is playing', status.message);
+  } else if (status.state === 'error' || status.state === 'disconnected') {
+    setPlaybackHealth('error', 'needs attention', 'Browser audio unavailable', status.message);
   }
 });
+
+function matchesRememberedDevice(device) {
+  if (!device) return false;
+  if (state.settings.deviceId && device.id === state.settings.deviceId) return true;
+  const sameName = state.settings.deviceName
+    && device.name.toLocaleLowerCase() === state.settings.deviceName.toLocaleLowerCase();
+  const sameType = !state.settings.deviceType
+    || device.type.toLocaleLowerCase() === state.settings.deviceType.toLocaleLowerCase();
+  return sameName && sameType;
+}
+
+async function checkPlaybackHealth() {
+  const generation = ++state.healthGeneration;
+  const mode = effectiveMode();
+  setPlaybackHealth('checking', 'checking', 'Checking sound', 'Confirming that the selected playback option is available.');
+
+  try {
+    if (mode === 'browser') {
+      await prepareBrowserReceiver();
+      if (generation !== state.healthGeneration || effectiveMode() !== mode) return;
+      setPlaybackHealth('ready', 'ready', 'Browser audio ready', 'Protected Spotify audio is connected in this browser.');
+      return;
+    }
+
+    if (mode === 'preview') {
+      if (!state.round) {
+        setPlaybackHealth('ready', 'ready', 'Direct audio ready', 'Previews will play directly on this device.');
+        return;
+      }
+      const url = await prefetchPreview(
+        state.round.track,
+        state.profile ? state.profile.country : null,
+      );
+      if (generation !== state.healthGeneration || effectiveMode() !== mode) return;
+      if (url) {
+        setPlaybackHealth('ready', 'ready', 'Direct audio ready', 'This round is preloaded and will play directly on this device.');
+      } else {
+        setPlaybackHealth('warning', 'finding another song', 'Preview unavailable', 'Likedle is finding another liked song with playable audio.');
+      }
+      return;
+    }
+
+    if (!state.settings.deviceId && !state.settings.deviceName) {
+      setPlaybackHealth('warning', 'choose a computer', 'Choose a receiver', 'Select your Mac or another Spotify receiver below.');
+      return;
+    }
+    const devices = await getDevices();
+    if (generation !== state.healthGeneration || effectiveMode() !== mode) return;
+    const remembered = devices.find(matchesRememberedDevice);
+    if (remembered && remembered.is_restricted) {
+      setPlaybackHealth('error', 'cannot control', 'Receiver cannot be controlled', `${remembered.name} rejects Spotify remote commands.`);
+      return;
+    }
+    const resolved = resolveDevice(devices, state.settings);
+    if (!resolved) {
+      setPlaybackHealth('error', 'offline', 'Receiver is offline', `Open Spotify on ${state.settings.deviceName || 'your computer'}, then refresh.`);
+      return;
+    }
+    if (
+      state.settings.deviceId !== resolved.id
+      || state.settings.deviceName !== resolved.name
+      || state.settings.deviceType !== resolved.type
+    ) {
+      state.settings.deviceId = resolved.id;
+      state.settings.deviceName = resolved.name;
+      state.settings.deviceType = resolved.type;
+      saveSettings(state.settings);
+    }
+    setPlaybackHealth(
+      'ready',
+      'ready',
+      `${resolved.name} is ready`,
+      resolved.is_active
+        ? 'Spotify reports this receiver as active.'
+        : 'Likedle will activate this receiver when you press Play.',
+    );
+  } catch (error) {
+    if (generation !== state.healthGeneration || effectiveMode() !== mode) return;
+    setPlaybackHealth('error', 'check failed', 'Could not check sound', error.message);
+  }
+}
 
 function maybeShowPremiumHint() {
   if (
@@ -390,12 +495,15 @@ function animateFill(durMs) {
 // ---------- Game: flow ----------
 
 function startRound(previewAttempt = 0) {
+  cancelSoundTest();
   stopPlayback();
   state.previewGeneration += 1;
+  state.healthGeneration += 1;
   state.audioPreparing = false;
   const answers = currentAnswers();
   if (!answers.length) return;
   state.round = newRound(answers, state.settings);
+  $('#testSoundBtn').disabled = false;
   state.selectedGuess = null;
   $('#revealCard').hidden = true;
   $('#controls').hidden = false;
@@ -406,20 +514,21 @@ function startRound(previewAttempt = 0) {
   updateStageUi();
   setPlayingUi(false);
   prepareRoundPlayback(state.round, previewAttempt);
+  if (effectiveMode() === 'device') checkPlaybackHealth();
 }
 
 async function prepareRoundPlayback(round, previewAttempt = 0) {
   const mode = effectiveMode();
   if (mode === 'browser') {
-    prepareBrowserReceiver().catch(() => {
-      // The receiver status listener shows the actionable failure state.
-    });
+    checkPlaybackHealth();
     return;
   }
   if (mode !== 'preview') return;
 
   const generation = ++state.previewGeneration;
+  state.healthGeneration += 1;
   state.audioPreparing = true;
+  setPlaybackHealth('checking', 'preloading', 'Preparing direct audio', 'Finding a playable preview for this round.');
   const btn = $('#playBtn');
   btn.disabled = true;
   $('#playBtnLabel').textContent = 'Finding audio...';
@@ -427,7 +536,10 @@ async function prepareRoundPlayback(round, previewAttempt = 0) {
   try {
     url = await prefetchPreview(round.track, state.profile ? state.profile.country : null);
   } catch { /* play will surface a source error if needed */ }
-  if (generation !== state.previewGeneration || state.round !== round) return;
+  if (
+    generation !== state.previewGeneration
+    || state.round !== round
+  ) return;
 
   if (!url && previewAttempt < 5) {
     startRound(previewAttempt + 1);
@@ -437,12 +549,98 @@ async function prepareRoundPlayback(round, previewAttempt = 0) {
   btn.disabled = false;
   updateStageUi();
   if (!url) {
+    setPlaybackHealth('warning', 'preview unavailable', 'Preview unavailable', 'Try Play again or choose your computer as the receiver.');
     toast('Could not pre-load a preview after several songs. You can retry Play or choose your computer in Settings.', 'error', 6500);
+  } else {
+    setPlaybackHealth('ready', 'ready', 'Direct audio ready', 'This round is preloaded and will play directly on this device.');
+  }
+}
+
+function rememberResolvedDevice(device) {
+  if (!device) return;
+  const changed = state.settings.deviceId !== device.id
+    || state.settings.deviceName !== device.name
+    || state.settings.deviceType !== device.type;
+  if (!changed) return;
+  state.settings.deviceId = device.id;
+  state.settings.deviceName = device.name;
+  state.settings.deviceType = device.type;
+  saveSettings(state.settings);
+}
+
+function markPlaybackHealthy(device, playing) {
+  const mode = effectiveMode();
+  if (mode === 'device') {
+    const name = (device && device.name) || state.settings.deviceName || 'Spotify receiver';
+    setPlaybackHealth(
+      'ready',
+      playing ? 'playing' : 'ready',
+      playing ? `${name} is playing` : `${name} is ready`,
+      playing ? 'The snippet started on your selected receiver.' : 'The receiver is available for the next snippet.',
+    );
+  } else if (mode === 'preview') {
+    setPlaybackHealth(
+      'ready',
+      playing ? 'playing' : 'ready',
+      playing ? 'Direct audio is playing' : 'Direct audio ready',
+      playing ? 'The snippet is playing on this device.' : 'This round is preloaded on this device.',
+    );
+  }
+}
+
+function finishSoundTest(generation = null) {
+  if (generation !== null && generation !== state.soundTestGeneration) return;
+  state.testingSound = false;
+  const button = $('#testSoundBtn');
+  button.disabled = !state.round;
+  button.textContent = 'Test sound';
+}
+
+function cancelSoundTest() {
+  state.soundTestGeneration += 1;
+  finishSoundTest();
+}
+
+async function onTestSound() {
+  if (!state.round || state.testingSound) return;
+  primeAudio();
+  if (effectiveMode() === 'browser') activateBrowserElement();
+  const generation = ++state.soundTestGeneration;
+  state.testingSound = true;
+  const button = $('#testSoundBtn');
+  button.disabled = true;
+  button.textContent = 'Testing...';
+  setPlayingUi(false);
+  state.healthGeneration += 1;
+
+  let result = null;
+  try {
+    result = await playSnippet(
+      state.round.track,
+      state.round.startMs,
+      STAGES_MS[0],
+      effectiveSettings(),
+      () => {
+        if (generation !== state.soundTestGeneration) return;
+        markPlaybackHealthy(result && result.device, false);
+        finishSoundTest(generation);
+      },
+    );
+    if (generation !== state.soundTestGeneration) return;
+    rememberResolvedDevice(result.device);
+    updateModeLine();
+    markPlaybackHealthy(result.device, true);
+    button.textContent = 'Playing...';
+  } catch (error) {
+    if (generation !== state.soundTestGeneration) return;
+    finishSoundTest(generation);
+    await handlePlayError(error, 'test');
   }
 }
 
 async function onPlay() {
   if (!state.round) return;
+  cancelSoundTest();
   primeAudio(); // synchronous, inside the gesture: unlocks audio on iOS
   if (effectiveMode() === 'browser') {
     activateBrowserElement(); // must run before the first await
@@ -450,6 +648,7 @@ async function onPlay() {
   if (state.playing) {
     await stopPlayback();
     setPlayingUi(false);
+    markPlaybackHealthy(null, false);
     return;
   }
   const round = state.round;
@@ -459,26 +658,22 @@ async function onPlay() {
   const btn = $('#playBtn');
   btn.disabled = true;
   $('#playBtnLabel').textContent = 'Starting...';
+  state.healthGeneration += 1;
+  let result = null;
   try {
-    const result = await playSnippet(
+    result = await playSnippet(
       round.track,
       round.startMs,
       durMs,
       effectiveSettings(),
-      () => setPlayingUi(false),
+      () => {
+        setPlayingUi(false);
+        markPlaybackHealthy(result && result.device, false);
+      },
     );
-    if (result.device) {
-      const changed = state.settings.deviceId !== result.device.id
-        || state.settings.deviceName !== result.device.name
-        || state.settings.deviceType !== result.device.type;
-      if (changed) {
-        state.settings.deviceId = result.device.id;
-        state.settings.deviceName = result.device.name;
-        state.settings.deviceType = result.device.type;
-        saveSettings(state.settings);
-        updateModeLine();
-      }
-    }
+    rememberResolvedDevice(result.device);
+    updateModeLine();
+    markPlaybackHealthy(result.device, true);
     setPlayingUi(true);
     animateFill(durMs);
   } catch (e) {
@@ -489,17 +684,19 @@ async function onPlay() {
   }
 }
 
-async function handlePlayError(e) {
+async function handlePlayError(e, source = 'game') {
   setPlayingUi(false);
   switch (e.code) {
     case 'canceled':
       return; // user stopped/advanced while starting - not an error
     case 'start-timeout':
+      setPlaybackHealth('error', 'did not start', 'Playback did not start', e.message);
       toast(e.message, 'error', 5000);
       return;
     case 'premium':
       state.settings.mode = 'preview';
       saveSettings(state.settings);
+      syncPlaybackModeControls();
       updateModeLine();
       prepareRoundPlayback(state.round);
       toast('Spotify Premium is needed for that mode. Switched to previews played directly here.', 'error', 6000);
@@ -511,36 +708,62 @@ async function handlePlayError(e) {
       if (state.profile && state.profile.product !== 'premium') {
         state.settings.mode = 'preview';
         saveSettings(state.settings);
+        syncPlaybackModeControls();
         updateModeLine();
         prepareRoundPlayback(state.round);
         toast('Spotify playback now requires Premium. Switched to previews played directly here.', 'error', 6500);
       } else {
+        setPlaybackHealth('error', 'playback refused', 'Spotify refused playback', e.message);
         toast(`${e.message} Refresh the receiver list or choose another playback option.`, 'error', 6500);
         openSettings();
       }
       break;
     case 'init':
+      setPlaybackHealth('error', 'unavailable', 'Browser audio unavailable', e.message);
       toast(`The Spotify browser receiver could not start: ${e.message}`, 'error', 7000);
       openSettings();
       break;
     case 'auth':
+      setPlaybackHealth('error', 'sign-in failed', 'Spotify rejected browser audio', e.message);
       toast('Spotify rejected the web player session. Check that "Web Playback SDK" is ticked in your Spotify app settings, or switch to previews in Settings.', 'error', 7000);
       break;
     case 'autoplay':
-      toast('Your browser blocked Spotify audio. Press Play once more, or use your computer as the Spotify receiver.', 'error', 6500);
+      setPlaybackHealth('warning', 'try again', 'Browser permission needed', e.message);
+      toast(
+        source === 'test'
+          ? 'Your browser blocked Spotify audio. Press Test sound once more.'
+          : 'Your browser blocked Spotify audio. Press Play once more, or use your computer as the Spotify receiver.',
+        'error',
+        6500,
+      );
       break;
     case 'gesture-required':
-      toast(e.message, 'info', 5000);
+      setPlaybackHealth(
+        'ready',
+        'ready',
+        'Browser audio ready',
+        source === 'test' ? 'Press Test sound again to allow protected audio.' : 'Press Play again to allow protected audio.',
+      );
+      toast(
+        source === 'test'
+          ? 'The browser receiver is ready. Press Test sound again.'
+          : e.message,
+        'info',
+        5000,
+      );
       break;
     case 'playback':
     case 'disconnected':
+      setPlaybackHealth('error', 'disconnected', 'Browser audio disconnected', e.message);
       toast(`${e.message} The receiver was reconnected once; choose your computer or direct previews if this continues.`, 'error', 7500);
       break;
     case 'restricted':
+      setPlaybackHealth('error', 'cannot control', 'Receiver cannot be controlled', e.message);
       toast(e.message, 'error', 6500);
       openSettings();
       break;
     case 'no-device':
+      setPlaybackHealth('error', 'offline', 'Receiver is offline', e.message);
       toast(e.message, 'error', 6000);
       openSettings();
       break;
@@ -549,13 +772,16 @@ async function handlePlayError(e) {
       startRound();
       break;
     default:
+      setPlaybackHealth('error', 'playback failed', 'Playback failed', e.message);
       toast(`Playback failed: ${e.message}`, 'error', 6000);
   }
 }
 
 function endRound() {
+  cancelSoundTest();
   stopPlayback();
   setPlayingUi(false);
+  markPlaybackHealthy(null, false);
   const round = state.round;
   const won = round.status === 'won';
   if (!state.uitest) recordResult(won, round.guesses.length);
@@ -586,8 +812,10 @@ function endRound() {
 function afterAttempt() {
   const round = state.round;
   if (round.status === 'playing') {
+    cancelSoundTest();
     stopPlayback();
     setPlayingUi(false);
+    markPlaybackHealthy(null, false);
     renderGuessRows();
     updateStageUi();
   } else {
@@ -688,7 +916,7 @@ document.addEventListener('click', (e) => {
 
 // ---------- Settings modal ----------
 
-function openSettings() {
+function syncPlaybackModeControls() {
   const isFree = state.profile && state.profile.product && state.profile.product !== 'premium';
   const mode = effectiveMode();
   $$('input[name="mode"]').forEach((r) => {
@@ -697,8 +925,14 @@ function openSettings() {
     r.closest('.radio-row').classList.toggle('disabled', isFree && r.value !== 'preview');
   });
   $('#premiumNote').hidden = !isFree;
-  $$('input[name="snippetStart"]').forEach((r) => { r.checked = r.value === state.settings.snippetStart; });
   toggleDevicePicker();
+  return mode;
+}
+
+function openSettings() {
+  const mode = syncPlaybackModeControls();
+  $$('input[name="snippetStart"]').forEach((r) => { r.checked = r.value === state.settings.snippetStart; });
+  $('#testSoundBtn').disabled = !state.round || state.testingSound;
   const cache = state.cache;
   let info = '';
   if (cache && cache.complete) {
@@ -710,26 +944,35 @@ function openSettings() {
   }
   $('#libraryInfo').textContent = info;
   $('#settingsModal').hidden = false;
+  if (mode !== 'device') checkPlaybackHealth();
 }
 
 function toggleDevicePicker() {
   const mode = effectiveMode();
   $('#devicePicker').hidden = mode !== 'device';
-  $('#receiverStatus').hidden = mode !== 'browser';
   if (mode === 'device') refreshDevices();
 }
 
 async function refreshDevices() {
+  const listGeneration = ++state.deviceListGeneration;
+  const healthGeneration = ++state.healthGeneration;
+  const updateHealth = (...args) => {
+    if (healthGeneration === state.healthGeneration) setPlaybackHealth(...args);
+  };
+  setPlaybackHealth('checking', 'checking', 'Checking receivers', 'Asking Spotify which devices are currently available.');
   const list = $('#deviceList');
   list.innerHTML = '<div class="device-empty">Looking for devices...</div>';
   try {
     const devices = await getDevices();
+    if (listGeneration !== state.deviceListGeneration || effectiveMode() !== 'device') return;
     list.innerHTML = '';
     if (!devices.length) {
       list.innerHTML = '<div class="device-empty">No receivers are online. Open Spotify on your Mac, then hit Refresh. An iPhone disappears again when iOS suspends Spotify.</div>';
+      updateHealth('error', 'offline', 'No receivers online', 'Open Spotify on your Mac, then refresh the receiver list.');
       return;
     }
 
+    const remembered = devices.find(matchesRememberedDevice);
     const refreshedSelection = resolveDevice(devices, state.settings);
     if (refreshedSelection && refreshedSelection.id !== state.settings.deviceId) {
       state.settings.deviceId = refreshedSelection.id;
@@ -737,6 +980,22 @@ async function refreshDevices() {
       state.settings.deviceType = refreshedSelection.type;
       saveSettings(state.settings);
       updateModeLine();
+    }
+    if (remembered && remembered.is_restricted) {
+      updateHealth('error', 'cannot control', 'Receiver cannot be controlled', `${remembered.name} rejects Spotify remote commands.`);
+    } else if (refreshedSelection) {
+      updateHealth(
+        'ready',
+        'ready',
+        `${refreshedSelection.name} is ready`,
+        refreshedSelection.is_active
+          ? 'Spotify reports this receiver as active.'
+          : 'Likedle will activate this receiver when you test or play a snippet.',
+      );
+    } else if (state.settings.deviceName) {
+      updateHealth('error', 'offline', 'Receiver is offline', `Open Spotify on ${state.settings.deviceName}, then refresh.`);
+    } else {
+      updateHealth('warning', 'choose a computer', 'Choose a receiver', 'Select your Mac or another Spotify receiver below.');
     }
 
     const rank = { Computer: 0, Speaker: 1, Smartphone: 2 };
@@ -761,7 +1020,12 @@ async function refreshDevices() {
         saveSettings(state.settings);
         $$('.device-item').forEach((el) => el.classList.remove('selected'));
         btn.classList.add('selected');
-        updateModeLine();
+        setPlaybackHealth(
+          'ready',
+          'ready',
+          `${d.name} is ready`,
+          d.is_active ? 'Spotify reports this receiver as active.' : 'Likedle will activate it when you test or play a snippet.',
+        );
         toast(
           d.type === 'Computer'
             ? `Your phone can stay on Likedle while "${d.name}" plays the snippets.`
@@ -772,18 +1036,23 @@ async function refreshDevices() {
       list.appendChild(btn);
     });
   } catch (error) {
+    if (listGeneration !== state.deviceListGeneration || effectiveMode() !== 'device') return;
     list.innerHTML = `<div class="device-empty">Could not load receivers: ${error.message}</div>`;
+    updateHealth('error', 'check failed', 'Could not check receivers', error.message);
   }
 }
 
 $('#settingsBtn').addEventListener('click', openSettings);
 $('#refreshDevicesBtn').addEventListener('click', refreshDevices);
+$('#testSoundBtn').addEventListener('click', onTestSound);
 
 $$('input[name="mode"]').forEach((r) => r.addEventListener('change', () => {
   if (r.value === 'browser') activateBrowserElement();
   stopPlayback();
+  cancelSoundTest();
   setPlayingUi(false);
   state.previewGeneration += 1;
+  state.healthGeneration += 1;
   state.audioPreparing = false;
   state.settings.mode = r.value;
   saveSettings(state.settings);
@@ -793,6 +1062,8 @@ $$('input[name="mode"]').forEach((r) => r.addEventListener('change', () => {
     $('#playBtn').disabled = false;
     updateStageUi();
     prepareRoundPlayback(state.round);
+  } else if (r.value !== 'device') {
+    checkPlaybackHealth();
   }
 }));
 
