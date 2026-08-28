@@ -400,6 +400,11 @@ async function onPlay() {
 function handlePlayError(e) {
   setPlayingUi(false);
   switch (e.code) {
+    case 'canceled':
+      return; // user stopped/advanced while starting - not an error
+    case 'start-timeout':
+      toast(e.message, 'error', 5000);
+      return;
     case 'premium':
       state.settings.mode = null;
       saveSettings(state.settings);

@@ -79,6 +79,51 @@ function initSdk() {
   return sdkReadyPromise;
 }
 
+// The OS "Now Playing" widget (and browser media hub) would display the real
+// track name during playback - mask it so the answer is not spoiled.
+function maskMediaSession() {
+  try {
+    if ('mediaSession' in navigator && window.MediaMetadata) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: 'Mystery song',
+        artist: 'Likedle',
+        album: 'No peeking',
+      });
+    }
+  } catch { /* unsupported */ }
+}
+
+// Waits until the SDK is audibly playing (position advancing past the seek
+// point). The SDK buffers for up to a few seconds before sound starts, so a
+// wall-clock stop timer would eat short snippets entirely.
+async function sdkWaitForStart(token, startMs) {
+  const t0 = performance.now();
+  while (performance.now() - t0 < 8000) {
+    if (token !== playToken) throw codedError('canceled', 'Playback canceled');
+    const st = await sdkPlayer.getCurrentState();
+    if (st && !st.paused && !st.loading && st.position > startMs) return st.position;
+    await sleep(90);
+  }
+  throw codedError('start-timeout', 'The Spotify player did not start in time - press play again.');
+}
+
+// Position-aware stop: pauses once the player has actually SOUNDED durMs of
+// audio, regardless of buffering stalls.
+async function sdkStopWhenDone(token, endMs, onEnded) {
+  while (token === playToken) {
+    let st = null;
+    try { st = await sdkPlayer.getCurrentState(); } catch { break; }
+    if (!st || st.paused) return; // stopped externally
+    const remaining = endMs - st.position;
+    if (remaining <= 70) break;
+    maskMediaSession();
+    await sleep(Math.min(Math.max(remaining - 40, 40), 150));
+  }
+  if (token !== playToken) return;
+  try { await sdkPlayer.pause(); } catch { /* best-effort */ }
+  if (onEnded) onEnded();
+}
+
 // Right after `ready`, the SDK device sometimes is not yet visible to the Web
 // API and the play command 404s. Retry briefly before giving up.
 async function playWithRetry(deviceId, uri, positionMs) {
@@ -239,8 +284,12 @@ export async function playSnippet(track, startMs, durMs, settings, onEnded) {
       if (e.status === 404) { sdkDeviceId = null; sdkReadyPromise = null; throw codedError('init', 'The web player disconnected - try again.'); }
       throw e;
     }
+    // Resolve only once audio is audibly rolling, and stop after durMs of
+    // HEARD audio - so the progress bar and the sound stay in sync.
+    const pos = await sdkWaitForStart(token, startMs);
     current = { mode, deviceId };
-    scheduleStop(token, durMs + SPOTIFY_LATENCY_PAD_MS, onEnded);
+    maskMediaSession();
+    sdkStopWhenDone(token, pos + durMs, onEnded);
     return { durMs };
   }
 
@@ -282,6 +331,7 @@ export async function playSnippet(track, startMs, durMs, settings, onEnded) {
   const maxStart = Math.max(0, 29000 - durMs);
   audio.currentTime = Math.min(startMs, maxStart) / 1000;
   await audio.play();
+  maskMediaSession();
   current = { mode, deviceId: null };
   scheduleStop(token, durMs, onEnded);
   return { durMs };
